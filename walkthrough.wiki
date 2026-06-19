@@ -1,0 +1,420 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= v4call-escrow — Deploy the Isolated Escrow Money Box on Alpine Linux =
+
+From CompleteNoobs
+
+This guide stands up the '''v4call-escrow''' box — the isolated, minimal Alpine host that becomes the '''settlement authority''' for v4call. It holds the '''only''' active money key, runs its own durable ledger, independently re-verifies every payment on-chain, and disburses. The busy, internet-facing '''v4call-node''' becomes a '''keyless reporter''': it sends a signed <code>event-report</code> over Nostr and the box replies with a signed <code>settlement-receipt</code>. A compromise of the node therefore '''cannot drain funds''' — the worst a lying report can do is re-split a call's already-on-chain deposit (see the [[#escrow-core walkthrough|escrow-core walkthrough]] for the money proof).
+
+'''This is the "deploy a box on a VPS" companion''' to the escrow-core walkthrough (which is about the ''library'', not a running service). Here we install that library + the box wrapper on a hardened Alpine host and bring the service up.
+
+'''Read first — this host will hold real money.''' Everything below biases toward a '''minimal, auditable''' surface: one inbound port (SSH, key-only), default-deny firewall, an unprivileged service user, and '''no dev tooling on the box'''. Set it up deliberately.
+
+'''Source code''': <code>escrow-core</code> [https://github.com/CompleteNoobs/escrow-core] · <code>v4call-escrow</code> (the box wrapper; published with v4call's repos).
+
+'''Version''': v4call-escrow 0.1.0 · escrow-core 0.1.0 · escrow report format <code>escrow-protocol/0.1</code>.
+
+'''End result''' (reproduced on a fresh Vultr Alpine 3.23 server, <code>escrow.v4call.com</code>): a patched, firewalled, key-only-SSH Alpine host running the box as an OpenRC service under an unprivileged user; '''escrow-core 72/72 + v4call-escrow 14/14 tests passing on the box'''; the box generating and '''stably persisting''' its reporting pubkey across restarts; its ledger created; and it subscribed to the nGate relays, listening for event-reports.
+
+== Contents ==
+
+* [[#What You Are Building|1 What You Are Building]]
+* [[#What You Need|2 What You Need]]
+* [[#Step 1: First Login and Recon|3 Step 1: First Login and Recon]]
+* [[#Step 2: Patch the System + Automatic Updates|4 Step 2: Patch the System + Automatic Updates]]
+* [[#Step 3: Firewall (default-deny, SSH-only)|5 Step 3: Firewall (default-deny, SSH-only)]]
+* [[#Step 4: Harden SSH + an Unprivileged Service User|6 Step 4: Harden SSH + an Unprivileged Service User]]
+* [[#Step 5: Install the Runtime|7 Step 5: Install the Runtime]]
+* [[#Step 6: Deploy the Code + Prove It on the Box|8 Step 6: Deploy the Code + Prove It on the Box]]
+* [[#Step 7: Configure the Box (.env + run wrapper)|9 Step 7: Configure the Box (.env + run wrapper)]]
+* [[#Step 8: Run It as a Service + Verify|10 Step 8: Run It as a Service + Verify]]
+* [[#Step 9: Go Live (the gated next phase)|11 Step 9: Go Live (the gated next phase)]]
+* [[#Security Notes|12 Security Notes]]
+* [[#Common Problems and Fixes|13 Common Problems and Fixes]]
+* [[#Quick Reference|14 Quick Reference]]
+* [[#Reproduction Notes|15 Reproduction Notes]]
+
+== What You Are Building ==
+
+{| class="wikitable"
+|-
+! Piece !! Role
+|-
+| '''v4call-escrow box''' (this host) || The settlement authority. Holds <code>V4CALL_ESCROW_KEY</code> (the only money key), its own SQLite ledger, and its own schnorr '''reporting key'''. Re-verifies every payment on-chain, settles, disburses, signs the receipt.
+|-
+| '''v4call-node''' (elsewhere) || The keyless reporter. Builds the call-end envelope from its shadow rows, publishes a signed <code>event-report</code> to the box, consumes the box's signed receipt. Holds '''no''' money key in box mode.
+|-
+| '''nGate relays''' (Nostr) || The transport. <code>escrow-protocol/0.1</code> payloads ride as kind-<code>31337</code> Nostr events; the '''inner schnorr signature''' is the trust gate, not the relay.
+|}
+
+Two keypairs to keep straight:
+
+* The box's '''reporting key''' (generated on first boot, persisted at <code>ESCROW_KEY_PATH</code>). Its '''pubkey''' is printed at boot — '''the node pins it''' as <code>ESCROW_BOX_PUBKEY</code> to verify receipts.
+* The node's '''reporting key''' (its Nostr identity). Its pubkey goes in the box's <code>ESCROW_EXPECTED_REPORTERS</code> — the box '''fail-closed rejects''' any other reporter.
+
+== What You Need ==
+
+* '''A fresh Alpine Linux 3.23 server''' with a public IP and root SSH access via key (this guide used a 1 vCPU / 1 GB Vultr instance — the box is light). A DNS name (e.g. <code>escrow.v4call.com</code>) is convenient but not required.
+* '''Your SSH private key''' for the box (here: <code>~/.ssh/vultr</code>). All commands below assume you connect as <code>root</code> with that key.
+* '''The code''': the <code>escrow-core</code> and <code>v4call-escrow</code> repos. Until they are published you transfer them from your dev box (Step 6); afterwards it's a <code>git clone</code>.
+* '''The node's escrow-reporting pubkey''' (64-hex) — printed by v4call-node at boot as <code>node reporting pubkey …</code>. You need it for the box's allow-list. (You can boot the box with a placeholder and fill it in before going live.)
+
+'''Convention''': set this once in your local shell so every command is copy-paste:
+
+ export BOX=root@escrow.v4call.com
+ export KEY=~/.ssh/vultr
+ alias boxssh='ssh -i $KEY $BOX'
+
+== Step 1: First Login and Recon ==
+
+ ssh -i ~/.ssh/vultr root@escrow.v4call.com
+
+Know what you're starting from — a fresh Alpine cloud image is tiny (busybox userland, OpenRC init, <code>apk</code> package manager, no systemd):
+
+ cat /etc/alpine-release          # 3.23.x
+ uname -a                         # kernel + arch
+ rc-status                        # running OpenRC services (expect: networking, chronyd, sshd)
+ cat /etc/apk/repositories        # main + community enabled; testing commented out
+ ss -tlnp                         # listening sockets — should be ONLY :22 (sshd)
+
+A clean image gives you root, an OpenRC system, and a single open port (SSH). Everything else you add deliberately.
+
+== Step 2: Patch the System + Automatic Updates ==
+
+Refresh the package index and apply all pending upgrades within the 3.23 release:
+
+ apk update
+ apk upgrade
+
+'''⚠ If the kernel was upgraded''' (you'll see <code>linux-virt</code> in the upgrade list), the '''running''' kernel is still the old one and its modules were just replaced on disk — so module loads (including the firewall's <code>nf_tables</code>) will fail until you '''reboot'''. Reboot now if the kernel moved:
+
+ reboot
+ # wait ~40s, then reconnect
+ uname -r        # confirm you're on the new kernel
+
+'''Automatic updates.''' Alpine has no <code>unattended-upgrades</code>; the idiomatic way is busybox <code>crond</code>, which runs the scripts in <code>/etc/periodic/{15min,hourly,daily,weekly,monthly}/</code>. Drop a daily upgrade job:
+
+<pre>
+cat > /etc/periodic/daily/apk-upgrade <<'EOF'
+#!/bin/sh
+# Daily: refresh the index and apply upgrades within the current Alpine release.
+apk update --quiet
+apk upgrade --no-interactive 2>&1 | logger -t apk-upgrade
+EOF
+chmod +x /etc/periodic/daily/apk-upgrade
+</pre>
+
+Enable + start crond, then dry-run the job once:
+
+ rc-update add crond default
+ rc-service crond start
+ /etc/periodic/daily/apk-upgrade        # should run cleanly
+
+'''Note''' — auto-applying upgrades trades a little change-control for staying patched. Alpine point releases are conservative (security/bugfix within 3.23), so this is a good default for an internet-facing money box. Kernel upgrades still need a reboot to take effect; schedule a maintenance reboot or watch <code>logger -t apk-upgrade</code> output.
+
+== Step 3: Firewall (default-deny, SSH-only) ==
+
+The box makes only '''outbound''' connections (HTTPS to Hive RPC, WSS to the nGate relays). The '''only''' inbound it needs is SSH. So: drop everything inbound except loopback, established traffic, ping, and tcp/22; allow all outbound. That is the entire policy, and it's auditable in one file.
+
+This guide uses '''nftables''' (modern, single-file, <code>nft list ruleset</code> shows the whole policy). Alpine's native alternative is '''awall''' (JSON policies on top of iptables) — see the note at the end of this step.
+
+ apk add nftables
+
+<pre>
+cat > /etc/nftables.nft <<'EOF'
+#!/usr/sbin/nft -f
+# v4call-escrow money box firewall. OUTBOUND only (Hive RPC + nGate relays); the
+# only inbound is SSH. Audit any time with: nft list ruleset
+flush ruleset
+
+table inet filter {
+  chain input {
+    type filter hook input priority filter; policy drop;
+    iif "lo" accept
+    ct state established,related accept
+    ct state invalid drop
+    ip protocol icmp accept                 comment "ping (IPv4)"
+    ip6 nexthdr ipv6-icmp accept            comment "ping (IPv6)"
+    tcp dport 22 ct state new accept        comment "SSH"
+  }
+  chain forward { type filter hook forward priority filter; policy drop; }
+  chain output { type filter hook output priority filter; policy accept; }
+}
+EOF
+</pre>
+
+'''Apply it safely''' — a firewall typo can lock you out, so arm a 3-minute auto-flush '''before''' loading. If you get locked out, it self-clears; if all is well, you cancel it.
+
+ # 1. safety net: flush the firewall in 180s no matter what
+ setsid sh -c "sleep 180 && nft flush ruleset" >/dev/null 2>&1 &
+ # 2. validate syntax, then load + enable at boot
+ nft -c -f /etc/nftables.nft && echo "syntax OK"
+ rc-update add nftables default
+ rc-service nftables start
+ nft list ruleset                 # eyeball the policy
+
+Now '''open a SECOND terminal''' and confirm a fresh SSH connection still works:
+
+ ssh -i ~/.ssh/vultr root@escrow.v4call.com 'echo through-firewall-ok'
+
+If that succeeds, cancel the safety net (back in the first session):
+
+ pkill -f "nft flush ruleset"
+
+'''Native-Alpine alternative (awall)''': <code>apk add awall iptables ip6tables</code>, drop a policy like <code>/etc/awall/optional/escrow.json</code> with one zone on <code>eth0</code> and a service filter allowing <code>ssh</code> inbound, then <code>awall enable escrow && awall activate</code>. It's the "official" Alpine firewall manager; nftables is used here for a smaller, more directly-auditable footprint on a money box.
+
+== Step 4: Harden SSH + an Unprivileged Service User ==
+
+'''Service user''' — never run the money process as root. Create an unprivileged user (no password, no SSH login of its own) and a deploy layout under <code>/opt/v4call</code>:
+
+ adduser -D -h /opt/v4call -s /bin/sh escrow
+ mkdir -p /opt/v4call/v4call-escrow/data
+ chown -R escrow:escrow /opt/v4call
+
+'''SSH hardening''' — key-only auth; root may log in '''only''' with a key (never a password). Alpine's sshd already <code>Include</code>s a drop-in dir, so add one file rather than editing the main config:
+
+<pre>
+cat > /etc/ssh/sshd_config.d/10-hardening.conf <<'EOF'
+# Money box SSH: key-only; root via key only, never password.
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+EOF
+</pre>
+
+Validate, then '''reload''' (reload keeps your current session alive; restart would not):
+
+ sshd -t && echo "config OK"
+ rc-service sshd reload
+ sshd -T | grep -iE '^(passwordauthentication|permitrootlogin|kbdinteractiveauthentication) '
+
+'''Test a fresh connection before trusting it''' (a second terminal):
+
+ ssh -i ~/.ssh/vultr root@escrow.v4call.com 'echo key-auth-ok'
+
+'''Going further (optional, recommended for production)''': create an admin user with <code>doas</code> (Alpine's <code>sudo</code>; already installed) and your key, verify it, then set <code>PermitRootLogin no</code>:
+
+ adduser -D you && addgroup you wheel
+ mkdir -p /home/you/.ssh && cp /root/.ssh/authorized_keys /home/you/.ssh/ && chown -R you:you /home/you/.ssh && chmod 700 /home/you/.ssh
+ echo 'permit persist :wheel' > /etc/doas.d/doas.conf
+ # confirm `ssh you@box` + `doas -u root id` work, THEN flip PermitRootLogin no and reload sshd.
+
+== Step 5: Install the Runtime ==
+
+The box is a Node app; <code>escrow-core</code>'s ledger is the native <code>better-sqlite3</code>, compiled at install time — so you need a C/C++ toolchain too.
+
+ apk add nodejs npm git build-base python3
+
+On Alpine 3.23 this gives '''Node 24''', npm 11, git, gcc 15, make, and Python 3.12. Confirm:
+
+ node --version && npm --version && git --version && gcc --version | head -1
+
+== Step 6: Deploy the Code + Prove It on the Box ==
+
+<code>escrow-core</code> and <code>v4call-escrow</code> must sit as '''siblings''' (the box's <code>package.json</code> depends on <code>"escrow-core": "file:../escrow-core"</code>):
+
+<pre>
+/opt/v4call/
+├── escrow-core/      ← the money engine library
+└── v4call-escrow/    ← the box wrapper (depends on ../escrow-core)
+</pre>
+
+'''Until the repos are published''', transfer them from your dev box with a tar pipe (no rsync needed on either end), excluding build artifacts and secrets:
+
+<pre>
+# run on your DEV box (where the repos live), pointing at the box:
+cd ~/CAI    # parent of escrow-core + v4call-escrow
+tar czf - --exclude=node_modules --exclude=.git --exclude='*.db' --exclude='*.db-*' \
+         --exclude=data --exclude=.env escrow-core v4call-escrow \
+  | ssh -i ~/.ssh/vultr root@escrow.v4call.com \
+      'tar xzf - -C /opt/v4call && chown -R escrow:escrow /opt/v4call'
+</pre>
+
+(Once published this step is simply <code>git clone</code> of each repo into <code>/opt/v4call/</code>.)
+
+'''Install + prove each, on the box, as the escrow user''' (so <code>node_modules</code> is owned by the service user):
+
+<pre>
+# escrow-core: compiles better-sqlite3, then runs its 72 offline tests
+su escrow -s /bin/sh -c 'cd /opt/v4call/escrow-core && npm install --no-audit --no-fund'
+su escrow -s /bin/sh -c 'cd /opt/v4call/escrow-core && node --test test/*.test.js' | grep -E '^. (tests|pass|fail) '
+
+# v4call-escrow: pulls escrow-core (file:) + nostr-tools + dhive, then runs its 14 tests
+su escrow -s /bin/sh -c 'cd /opt/v4call/v4call-escrow && npm install --no-audit --no-fund'
+su escrow -s /bin/sh -c 'cd /opt/v4call/v4call-escrow && node --test test/*.test.js' | grep -E '^. (tests|pass|fail) '
+</pre>
+
+Expect '''escrow-core 72/72''' and '''v4call-escrow 14/14''', all offline. ''(better-sqlite3 compiles from source on the first install — a minute or two on 1 vCPU; that's expected.)''
+
+'''⚠ Node 24 test invocation''' — the repos' <code>npm test</code> script is <code>node --test test/</code> (a bare directory arg). Newer Node (24, what Alpine 3.23 ships) rejects that with <code>Cannot find module '…/test'</code>. Use the explicit glob <code>node --test test/*.test.js</code> as above (or update the package.json <code>test</code> script to the glob).
+
+Optionally run the money-safety harness here too (it needs no key/funds/network — see the escrow-core walkthrough Step 10):
+
+ su escrow -s /bin/sh -c 'cd /opt/v4call/escrow-core && node scripts/dry-run-adversarial.js' | tail -2
+ # expect: ALL GUARDS HELD — 13/13
+
+== Step 7: Configure the Box (.env + run wrapper) ==
+
+The box reads pure <code>process.env</code> (no <code>dotenv</code> dependency, by design — fewer moving parts on a money box). So we keep config in a <code>chmod 600</code> <code>.env</code> and a tiny wrapper that '''sources''' it before exec.
+
+'''The env contract''' (from <code>index.js</code>): <code>V4CALL_ESCROW_KEY</code>, <code>FEE_ACCOUNT</code>, and <code>ESCROW_EXPECTED_REPORTERS</code> are '''required''' (the box exits if any is missing or malformed); the rest have defaults.
+
+<pre>
+cat > /opt/v4call/v4call-escrow/.env <<'EOF'
+# v4call-escrow money box config (sourced by run.sh; keep values shell-safe, no spaces)
+ESCROW_ACCOUNT=v4call-escrow
+ESCROW_CURRENCY=HBD
+# THE MONEY KEY — the escrow account's ACTIVE key (5K…/5J…). This file is the ONLY
+# place it lives. For a first boot / dry-run you may use a THROWAWAY key (the box only
+# parses it when it disburses), then swap in the real key before live settlement.
+V4CALL_ESCROW_KEY=PUT_THROWAWAY_THEN_REAL_ACTIVE_KEY_HERE
+# Platform-fee recipient (ring fee + the % cut).
+FEE_ACCOUNT=v4call
+# Durable ledger + the box's own reporting key (auto-created on first boot).
+ESCROW_DB_PATH=/opt/v4call/v4call-escrow/data/v4call-escrow.db
+ESCROW_KEY_PATH=/opt/v4call/v4call-escrow/data/escrow-reporting-key.json
+# nGate relays the box subscribes on (event-reports) / publishes receipts to.
+# Use relays YOU control; add a second for redundancy once you have one.
+NOSTR_RELAYS=wss://nostr.v4call.com
+# FAIL-CLOSED: the node escrow-reporting pubkey(s) this box accepts (64-hex, comma-sep).
+# Replace with YOUR node's "node reporting pubkey …" from its boot log.
+ESCROW_EXPECTED_REPORTERS=REPLACE_WITH_YOUR_NODE_REPORTING_PUBKEY
+MAX_CALL_DURATION_MIN=120
+EOF
+chown escrow:escrow /opt/v4call/v4call-escrow/.env
+chmod 600 /opt/v4call/v4call-escrow/.env
+</pre>
+
+''Need a throwaway key for the first boot?'' Generate one with the dhive that's already installed (never funded — replace before going live):
+
+ su escrow -s /bin/sh -c 'cd /opt/v4call/v4call-escrow && node -e "console.log(require(\"@hiveio/dhive\").PrivateKey.fromSeed(require(\"crypto\").randomBytes(16).toString(\"hex\")).toString())"'
+
+'''The run wrapper''' loads <code>.env</code> into the environment, then execs the box:
+
+<pre>
+cat > /opt/v4call/v4call-escrow/run.sh <<'EOF'
+#!/bin/sh
+cd /opt/v4call/v4call-escrow || exit 1
+set -a; . ./.env; set +a
+exec node index.js
+EOF
+chmod +x /opt/v4call/v4call-escrow/run.sh
+chown escrow:escrow /opt/v4call/v4call-escrow/run.sh
+</pre>
+
+== Step 8: Run It as a Service + Verify ==
+
+An OpenRC init script runs the wrapper as the unprivileged <code>escrow</code> user, supervises it, and logs to <code>/var/log</code>:
+
+<pre>
+cat > /etc/init.d/v4call-escrow <<'EOF'
+#!/sbin/openrc-run
+name="v4call-escrow"
+description="v4call escrow money box (settlement authority)"
+command="/opt/v4call/v4call-escrow/run.sh"
+command_user="escrow:escrow"
+command_background="yes"
+pidfile="/run/v4call-escrow.pid"
+output_log="/var/log/v4call-escrow.log"
+error_log="/var/log/v4call-escrow.log"
+depend() { need net; }
+EOF
+chmod +x /etc/init.d/v4call-escrow
+touch /var/log/v4call-escrow.log && chown escrow:escrow /var/log/v4call-escrow.log
+</pre>
+
+Enable at boot, start, and read the log:
+
+ rc-update add v4call-escrow default
+ rc-service v4call-escrow start
+ rc-service v4call-escrow status
+ cat /var/log/v4call-escrow.log
+
+'''A healthy boot looks like this''':
+
+<pre>
+[escrow-box] generated box reporting key → …/data/escrow-reporting-key.json (pubkey e05ac3d977…35659)
+[escrow-box] subscribed for escrow events on 2 relay(s) as e05ac3d977…
+[escrow-box] escrow box listening for event-reports
+[escrow-box] escrow-core 0.1.0 ready: @v4call-escrow (HBD) · ledger …/data/v4call-escrow.db
+[escrow-box]   box reporting pubkey: e05ac3d977…35659   ← the node must pin this to verify receipts
+[escrow-box]   trusts 1 reporter key(s); fee → @v4call; 2 relay(s)
+</pre>
+
+'''Record the box reporting pubkey''' — that hex is what the node sets as <code>ESCROW_BOX_PUBKEY</code>.
+
+'''Verify the two properties that matter''':
+
+* '''Key persistence''' — restart and confirm the SAME pubkey (the node pins it, so it must survive restarts/reboots):
+  rc-service v4call-escrow restart
+  grep -o 'box reporting pubkey: [0-9a-f]*' /var/log/v4call-escrow.log | tail -1
+* '''Runs unprivileged''' — <code>ps -o user,args | grep '[n]ode index.js'</code> shows user <code>escrow</code>, not root.
+* '''Survives reboot''' — <code>reboot</code>, reconnect, <code>rc-service v4call-escrow status</code> is <code>started</code> and the log shows the same pubkey.
+
+== Step 9: Go Live (the gated next phase) ==
+
+The box is '''stood up''' but not yet carrying real money. Before any production node settles real funds through it:
+
+# '''Provision the real key''' — replace the throwaway <code>V4CALL_ESCROW_KEY</code> in <code>.env</code> with the escrow account's actual '''active''' key, and restart the service. This is the moment the host becomes a real money box — treat it accordingly.
+# '''Wire the trust both ways''' — put the box's reporting pubkey in the node's <code>ESCROW_BOX_PUBKEY</code>, and the node's reporting pubkey in the box's <code>ESCROW_EXPECTED_REPORTERS</code>; restart both. Flip the node to <code>ESCROW_MODE=box</code> and remove <code>V4CALL_ESCROW_KEY</code> from the node.
+# '''Run the TEST-token dry-run''' (mandatory — escrow-core walkthrough Step 10): verify + refund against a throwaway Hive-Engine TEST token (never real HBD), plus the scripted replay-reject + crash-no-double-disburse harness (<code>node scripts/dry-run-adversarial.js</code> → <code>ALL GUARDS HELD</code>). '''Only then''' point a production node at the box.
+
+== Security Notes ==
+
+* '''No Claude / no dev tooling on the money box.''' Operate it via logs (<code>/var/log/v4call-escrow.log</code>), the serial/VNC console, and the package manager — not AI agents or editors running on the host. This rule stands for the box's operational life; treat any one-off setup waiver as exactly that.
+* '''The key lives in exactly one file''' — <code>.env</code>, <code>chmod 600</code>, owned by <code>escrow</code>. Back it up like cash. The node holds no money key.
+* '''Minimal surface''' — one inbound port (SSH, key-only), default-deny firewall, unprivileged service user, patched daily. Don't add an HTTP server, a database server, or extra users it doesn't need.
+* '''Fail-closed trust''' — <code>ESCROW_EXPECTED_REPORTERS</code> is required; a report signed by any other key is rejected. The on-chain re-verification + conservation (escrow-core) mean even a trusted-but-lying report can only re-split a verified deposit, never mint.
+* '''Each escrow is its own box/account/key/DB''' — never share a money box between services.
+
+== Common Problems and Fixes ==
+
+=== nftables: "Your kernel lacks nftables support" / "Unable to initialize Netlink socket" ===
+You upgraded the kernel (<code>apk upgrade</code> pulled <code>linux-virt</code>) but haven't rebooted, so the running kernel's modules no longer match what's on disk. '''Reboot''', then start nftables.
+
+=== <code>npm test</code> fails with <code>Cannot find module '…/test'</code> ===
+Node 24's test runner rejects the bare-directory arg in the repos' <code>npm test</code> script (<code>node --test test/</code>). Run <code>node --test test/*.test.js</code> instead, or update the <code>test</code> script to that glob.
+
+=== <code>npm install</code> fails on better-sqlite3 (node-gyp / make: not found) ===
+The build toolchain is missing. <code>apk add build-base python3</code> and re-run. (better-sqlite3 is a native module compiled at install.)
+
+=== Relay NOTICE: "bad req: provided filter is not an object" ===
+A '''client bug''', exposed by a strict relay. The transport's <code>subscribeMany(relays, filter, params)</code> takes a '''single filter object''' and wraps it internally; passing an '''array''' (<code>[{…}]</code>) double-wraps it so the REQ carries an array where a filter object belongs. Lenient relays accept it anyway; '''strfry''' (what nGate fronts) correctly rejects it. Fixed in <code>nostr-transport.mjs</code> (box) and <code>escrow-box-client.mjs</code> (node) by passing the object directly: <code>subscribeMany(relays, { kinds: [31337], '#p': [selfPub] }, …)</code>. A clean boot shows '''no''' such NOTICE. (Separately: to '''publish''' receipts, the box's reporting pubkey must be accepted by the relay — nGate whitelisting — which is a Step 9 item.)
+
+=== The box exits immediately with a FATAL line ===
+It's fail-closed config validation: <code>V4CALL_ESCROW_KEY</code>, <code>FEE_ACCOUNT</code>, or <code>ESCROW_EXPECTED_REPORTERS</code> missing/malformed (the latter must be 64-hex). Fix <code>.env</code> and restart. Check the log: <code>cat /var/log/v4call-escrow.log</code>.
+
+=== Service won't start / no log output ===
+<code>rc-service v4call-escrow status</code>, then run the wrapper by hand as the service user to see the error directly: <code>su escrow -s /bin/sh -c '/opt/v4call/v4call-escrow/run.sh'</code> (Ctrl-C to stop). Common causes: <code>.env</code> not readable by <code>escrow</code>, or a non-shell-safe value in <code>.env</code> (it is <code>source</code>d — keep values quote-free and space-free).
+
+== Quick Reference ==
+
+;Versions (Alpine 3.23)
+: Node 24 · npm 11 · gcc 15 · escrow-core 0.1.0 · v4call-escrow 0.1.0.
+;Service control
+: <code>rc-service v4call-escrow {start|stop|restart|status}</code> · log: <code>/var/log/v4call-escrow.log</code> · enable at boot: <code>rc-update add v4call-escrow default</code>.
+;Firewall
+: <code>nft list ruleset</code> (audit) · default-drop inbound, SSH-only, all outbound · config <code>/etc/nftables.nft</code>.
+;The key
+: <code>/opt/v4call/v4call-escrow/.env</code> (<code>chmod 600</code>, owned <code>escrow</code>) — the ONLY place <code>V4CALL_ESCROW_KEY</code> lives.
+;Prove it
+: <code>node --test test/*.test.js</code> in each repo (72 + 14) · <code>node scripts/dry-run-adversarial.js</code> in escrow-core (13/13).
+;The two pubkeys
+: box → node as <code>ESCROW_BOX_PUBKEY</code> · node → box in <code>ESCROW_EXPECTED_REPORTERS</code>.
+;Source of truth
+: escrow-core <code>walkthrough.wiki</code> (the money engine + dry-run) · <code>handover-decoupling.md</code> · the v4call-node box-mode flip (<code>ESCROW_MODE</code>).
+
+== Reproduction Notes ==
+
+Reproduced exactly as written on a fresh '''Vultr Alpine 3.23.2''' instance (<code>escrow.v4call.com</code>, 1 vCPU / 1 GB), 2026-06-18:
+
+* '''Step 2''' upgraded 39 packages including the kernel (<code>linux-virt</code> 6.18.1 → 6.18.35); the '''reboot-before-firewall''' lesson is real — nftables would not initialize until the box ran the matching kernel. Auto-update cron installed + dry-run clean.
+* '''Step 3''' nftables loaded cleanly post-reboot; a fresh SSH connection through the policy confirmed before cancelling the safety net.
+* '''Step 4''' SSH hardened to key-only + <code>prohibit-password</code>; fresh key-auth connection re-tested OK.
+* '''Step 5''' installed Node v24.14.1 / npm 11 / gcc 15.
+* '''Step 6''' better-sqlite3 compiled from source on Node 24; '''escrow-core 72/72''' and '''v4call-escrow 14/14''' passed on the box (with the <code>node --test test/*.test.js</code> glob — the bare-dir <code>npm test</code> fails on Node 24).
+* '''Step 8''' the box generated its reporting key (<code>e05ac3d977…35659</code>), opened its ledger, subscribed on its single owned relay, and '''held the same pubkey across a restart'''. Five services auto-start at boot: <code>chronyd, crond, nftables, sshd, v4call-escrow</code>. A subscription NOTICE (<code>filter is not an object</code>) was traced to a transport bug — <code>subscribeMany</code> takes a single filter object, not an array — and fixed (see Common Problems); strfry then accepted the subscription cleanly.
+
+The box was stood up with a '''throwaway''' key and a '''placeholder''' reporter pubkey — i.e. it is running and proven, but Step 9 (real key, real node pubkey, TEST-token dry-run) is still pending before it settles real funds.

@@ -1,0 +1,26 @@
+{
+  "name": "v4call-escrow",
+  "version": "0.1.0",
+  "description": "Isolated v4call escrow money box — the SETTLEMENT AUTHORITY. Wraps escrow-core; holds the only active key + its own durable ledger; the node is a keyless reporter that talks to it over escrow-protocol/0.1 (signed event-report → settlement-receipt over Nostr).",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@hiveio/dhive": "^1.3.2",
+    "escrow-core": "file:../escrow-core",
+    "nostr-tools": "^2.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "hive",
+    "escrow",
+    "custodial",
+    "v4call",
+    "money-box"
+  ]
+}

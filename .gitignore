@@ -1,0 +1,23 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────────────────
+.env
+*.key
+*.pem
+data/escrow-reporting-key.json
+
+# ── Runtime data (the durable money ledger lives here) ────────────────────────
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ── Node ──────────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+
+# ── Docker build vendoring (escrow-core copied in for the image; never committed)
+vendor/
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+*.swp
