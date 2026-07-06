@@ -74,6 +74,20 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
 
   const reject = (ref, reason) => { log('warn', `report rejected (ref=${ref}): ${reason}`); return { status: 'rejected', ref, reason }; };
 
+  // PERMANENT rejection of an AUTHORIZED, signature-valid report → also return a signed
+  // status:'failed' receipt so the node's retry-until-received drainer gets a terminal
+  // answer and stops republishing (without this a structurally-bad report loops forever).
+  // Never used for the hard gates (bad sig / unauthorized reporter) — those stay silent:
+  // an untrusted counterparty gets no receipt oracle. Transient errors keep status:'retry'.
+  const rejectTerminal = (ref, reason, currency) => {
+    log('warn', `report rejected TERMINALLY (ref=${ref}): ${reason}`);
+    const receipt = escrowCore.buildSettlementReceipt({
+      ref, settlement: 0, refund: 0, dust: 0, currency: currency || config.currency,
+      disburseTx: null, status: 'failed', reason, createdAt: nowFn(),
+    });
+    return { status: 'rejected', ref, reason, receipt: boxSkHex ? escrowCore.signReport(receipt, boxSkHex) : receipt };
+  };
+
   function authorizedReporter(pubkey) {
     // If no allow-list is configured the box refuses ALL reports (fail closed) — a money
     // box must know which reporting key(s) it trusts.
@@ -104,7 +118,10 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
    *   { status:'settled'|'pending'|'failed', ref, receipt, outflows }   — a real settlement
    *   { status:'duplicate'|'already_settled', ref, receipt? }           — idempotent no-op
    *   { status:'retry', ref, reason }                                   — transient; node re-reports
-   *   { status:'rejected', ref, reason }                                — bad sig / unauthorized / shape
+   *   { status:'rejected', ref, reason }                                — bad sig / unauthorized (silent)
+   *   { status:'rejected', ref, reason, receipt }                       — authorized but structurally bad:
+   *                                                                       carries a signed status:'failed'
+   *                                                                       receipt so the node stops retrying
    */
   async function handleReport(signed) {
     const ref = signed && signed.ref;
@@ -180,7 +197,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
         s + (DEPOSIT_PURPOSES.has(x.purpose) ? (Number(x.v.paid) || 0) : 0), 0);
       const guardFloor = Math.pow(10, -placesFor((verified[0] && verified[0].v.currency) || config.currency));
       if (assertRing0 + assertConnect0 > depositVerified + guardFloor) {
-        return reject(ref, 'asserted_split_exceeds_deposit');
+        return rejectTerminal(ref, 'asserted_split_exceeds_deposit', facts.currency);
       }
     }
 
@@ -214,7 +231,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     const payRows = ledger.getPaymentsByRef(ref);
     if (payRows.length === 0) {
       log('warn', `ref ${ref} has no verified payments — nothing to settle`);
-      return { status: 'rejected', ref, reason: 'no_verified_payments' };
+      return rejectTerminal(ref, 'no_verified_payments', facts.currency);
     }
     if (!ledger.atomicClose(ref)) {
       log('info', `ref ${ref} lost atomicClose race — already settling/settled`);
@@ -324,7 +341,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
    */
   async function handleSinglePayment(signed, ref, facts) {
     const payments = Array.isArray(facts.payments) ? facts.payments : [];
-    if (payments.length !== 1) return reject(ref, 'single-payment report must carry exactly one payment');
+    if (payments.length !== 1) return rejectTerminal(ref, 'single-payment report must carry exactly one payment', facts.currency);
     const p = payments[0];
     const currency = p.currency || facts.currency || config.currency;
 
@@ -338,14 +355,14 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
       );
     } catch (e) {
       if (isTransient(e)) return { status: 'retry', ref, reason: `verify ${p.txId}: ${e.message}` };
-      return reject(ref, `structural verify failure: ${e.message}`);
+      return rejectTerminal(ref, `structural verify failure: ${e.message}`, currency);
     }
     const verifySidechain = deps.verifySidechain || escrowCore.verifySidechain;
     if (!escrowCore.isNativeCurrency(v.currency) && verifySidechain) {
       try { await verifySidechain(p.txId); }
       catch (e) {
         if (isTransient(e)) return { status: 'retry', ref, reason: `sidechain ${p.txId}: ${e.message}` };
-        return reject(ref, `sidechain reject: ${e.message}`);
+        return rejectTerminal(ref, `sidechain reject: ${e.message}`, currency);
       }
     }
 
@@ -364,7 +381,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     const payRows = ledger.getPaymentsByRef(ref);
     if (payRows.length === 0) {
       log('warn', `ref ${ref} has no verified payment — nothing to settle`);
-      return { status: 'rejected', ref, reason: 'no_verified_payments' };
+      return rejectTerminal(ref, 'no_verified_payments', currency);
     }
     if (!ledger.atomicClose(ref)) {
       log('info', `ref ${ref} lost atomicClose race — already settling/settled`);

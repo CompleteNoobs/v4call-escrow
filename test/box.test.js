@@ -447,3 +447,64 @@ test('R — a FORGED single-payment amount (not on chain) is rejected, nothing d
   assert.equal(s.broadcast.sent.length, 0);
   assert.equal(s.ledger.getPaymentsByRef('dmR').length, 0, 'nothing recorded, ref left open for a corrected re-report');
 });
+
+// ── Terminal rejection receipts (the "wrong escrow account" incident, 2026-07-06) ──
+// An AUTHORIZED report whose payment is structurally bad (e.g. the on-chain transfer went
+// to an account this box doesn't hold) must come back with a SIGNED status:'failed' receipt
+// so the node's retry-until-received drainer stops republishing it — without one, the node
+// loops the same doomed report forever (observed live: 631 attempts). Hard-gate rejections
+// (bad sig / unauthorized) stay SILENT: an untrusted counterparty gets no receipt oracle.
+
+test('S — payment to the WRONG account: rejected WITH a signed failed receipt (terminal)', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const ref = 'dmS', txId = 'tx_dmS', m = memo('text', ref);
+  // The on-chain transfer went to some OTHER escrow account — not config.account.
+  s.chain.add(txId, { sender: 'cnoobz', account: 'old-prod-escrow', amount: 3, memo: m });
+  const facts = { kind: 'single-payment', currency: 'HBD', payoutTo: 'completenoober', platformFee: 0.10,
+    payments: [{ txId, sender: 'cnoobz', amount: 3, memo: m, currency: 'HBD' }] };
+  const report = escrowCore.buildEventReport({ service: 'v4call', ref, subject: ref, facts,
+    nonce: `${ref}:settle`, createdAt: NOW, reporter: 'tnode' });
+  const out = await s.box.handleReport(escrowCore.signReport(report, s.nodeSk));
+
+  assert.equal(out.status, 'rejected');
+  assert.ok(out.receipt, 'terminal rejection carries a receipt');
+  assert.equal(out.receipt.status, 'failed');
+  assert.match(out.receipt.reason, /wrong account/);
+  assert.equal(out.receipt.settlement, 0);
+  assert.equal(out.receipt.refund, 0);
+  assert.ok(escrowCore.verifyReport(out.receipt, s.boxPub), 'failed receipt verifies under the box key');
+  assert.equal(s.broadcast.sent.length, 0, 'nothing disbursed');
+});
+
+test('T — hard-gate rejections stay SILENT: unauthorized reporter gets NO receipt', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const strangerSk = crypto.randomBytes(32).toString('hex');
+  const signed = singlePayment(s, 'dmT', { payoutTo: 'completenoober', sk: strangerSk });
+  // re-sign under a key NOT in expectedReporters (sig itself is valid)
+  const out = await s.box.handleReport(signed);
+  assert.equal(out.status, 'rejected');
+  assert.equal(out.receipt, undefined, 'no receipt for an untrusted counterparty');
+  assert.equal(s.broadcast.sent.length, 0);
+});
+
+test('U — call-end with only forged payments: rejected terminally with a failed receipt', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const ref = 'callU';
+  // Report references a tx that does not exist on chain at all → dropped → no verified payments.
+  const facts = { kind: 'call-end', endReason: 'ended', durationMs: HALF_HOUR, currency: 'HBD',
+    callFacts: { ratePerHour: 1, platformFee: 0.10, callee: 'completenoober', startTs: NOW - HALF_HOUR },
+    payments: [{ txId: 'tx_never_broadcast', sender: 'cnoobz', purpose: 'deposit', amount: 2, memo: memo('deposit', ref), currency: 'HBD' }] };
+  const report = escrowCore.buildEventReport({ service: 'v4call', ref, subject: ref, facts,
+    nonce: `${ref}:settle`, createdAt: NOW, reporter: 'tnode' });
+  const out = await s.box.handleReport(escrowCore.signReport(report, s.nodeSk));
+
+  assert.equal(out.status, 'rejected');
+  assert.ok(out.receipt, 'terminal rejection carries a receipt');
+  assert.equal(out.receipt.status, 'failed');
+  assert.equal(out.receipt.reason, 'no_verified_payments');
+  assert.ok(escrowCore.verifyReport(out.receipt, s.boxPub));
+  assert.equal(s.broadcast.sent.length, 0);
+});
