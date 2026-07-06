@@ -508,3 +508,45 @@ test('U — call-end with only forged payments: rejected terminally with a faile
   assert.ok(escrowCore.verifyReport(out.receipt, s.boxPub));
   assert.equal(s.broadcast.sent.length, 0);
 });
+
+// ── v0.17 paid expert offers ride the SAME call-end path with roles inverted ──
+// The node funds an offer with ONE transfer memo'd `v4call:deposit:<offerId>` —
+// the canonical refundable-cap purpose (the over-assert guard + per-call column
+// persistence recognize exactly {call, deposit, topup}; an unknown purpose like
+// 'offer' would fail the connectFee carve). It asserts connectFee via
+// callFacts.connectPaid (the Option-B carve) and reports callee=EXPERT /
+// sender=ADMIN. This locks what v4call-node's expert settlement rests on: the
+// split pays the expert connect+metered, refunds the admin the unused cap, conserves.
+
+test('V — expert-offer settlement: payout→expert (connect+metered), refund→admin, conserves the cap', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const offerId = 'xo_abc123';
+  const txId = `tx_${offerId}`;
+  const m = `v4call:deposit:${offerId}`;                        // canonical deposit purpose
+  // Offer: connect 0.5 + 6/hr × 30min max → cap 3.5, funded as ONE transfer.
+  s.chain.add(txId, { sender: 'adminuser', account: s.config.account, amount: 3.5, memo: m });
+  // Session ran 10 minutes → metered 1.0. Expert gross = 0.5 connect + 1.0 = 1.5;
+  // fee 10% = 0.15; expert net 1.35; admin refund = cap 3.5 − 0.5 − 1.0 = 2.0.
+  const callFacts = { ratePerHour: 6, platformFee: 0.10, callee: 'expertuser',
+    startTs: NOW - 10 * 60 * 1000, maxDurationMin: 30, connectPaid: 0.5 };
+  const facts = { kind: 'call-end', endReason: 'left_room', endedAt: NOW, durationMs: 10 * 60 * 1000,
+    currency: 'HBD', callFacts,
+    payments: [{ txId, sender: 'adminuser', purpose: 'deposit', amount: 3.5, memo: m, currency: 'HBD' }] };
+  const report = escrowCore.buildEventReport({ service: 'v4call', ref: offerId, subject: offerId, facts,
+    nonce: `${offerId}:settle`, createdAt: NOW, reporter: 'tnode' });
+  const out = await s.box.handleReport(escrowCore.signReport(report, s.nodeSk));
+
+  assert.equal(out.status, 'settled');
+  assert.equal(s.broadcast.sent.length, 3, 'payout + refund + fee');
+  const byKind = {};
+  for (const o of out.outflows) byKind[o.kind] = o;
+  assert.equal(byKind.payout.to_account, 'expertuser', 'expert is paid');
+  assert.equal(Number(byKind.payout.amount), 1.35, 'connect 0.5 + metered 1.0, minus 10% fee');
+  assert.equal(byKind.refund.to_account, 'adminuser', 'admin gets the unused cap back');
+  assert.equal(Number(byKind.refund.amount), 2.0);
+  assert.equal(Number(byKind.platform_fee.amount), 0.15);
+  const total = out.outflows.reduce((s2, o) => s2 + Number(o.amount), 0);
+  assert.ok(Math.abs(total - 3.5) < 1e-9, 'outflows conserve the funded cap');
+  assert.ok(escrowCore.verifyReport(out.receipt, s.boxPub));
+});
