@@ -378,3 +378,72 @@ test('N — an OVER-ASSERTED re-split (ring+connect > verified deposit) is rejec
   // rejected pre-commit → the ref is NOT closed; a corrected re-report can still settle it.
   assert.equal(s.ledger.getPaymentsByRef('cN').length, 0, 'no rows recorded, ref left open for a corrected re-report');
 });
+
+// ── Single-payment settlements (paid DMs/attachments/invites/ring-fee refunds) ──
+// No duration/cap/ring-connect-deposit concept: the box verifies the ONE reported payment
+// itself and splits gross → net (payoutTo) + fee (feeAccount), or — platformFee 0 — a pure
+// refund of the whole verified amount back to payoutTo.
+function singlePayment(s, ref, { amount = 3, sender = 'cnoobz', payoutTo, platformFee = 0.10, sk } = {}) {
+  const txId = `tx_${ref}`;
+  const m = memo('text', ref);
+  s.chain.add(txId, { sender, account: s.config.account, amount, memo: m });
+  const facts = { kind: 'single-payment', currency: 'HBD', payoutTo, platformFee,
+    payments: [{ txId, sender, amount, memo: m, currency: 'HBD' }] };
+  const report = escrowCore.buildEventReport({ service: 'v4call', ref, subject: ref, facts,
+    nonce: `${ref}:settle`, createdAt: NOW, reporter: 'tnode' });
+  return escrowCore.signReport(report, sk || s.nodeSk);
+}
+
+test('O — single-payment happy path: net + fee, conserves the verified amount', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const signed = singlePayment(s, 'dmO', { amount: 3, payoutTo: 'completenoober', platformFee: 0.10 });
+  const out = await s.box.handleReport(signed);
+
+  assert.equal(out.status, 'settled');
+  assert.equal(s.broadcast.sent.length, 2, 'payout + fee disbursed');
+  const byMemo = Object.fromEntries(s.broadcast.sent.map(x => [x.memo.split(':')[1], x]));
+  assert.equal(parseFloat(byMemo.payout.amount), 2.7);
+  assert.equal(parseFloat(byMemo.fee.amount), 0.3);
+  assert.ok(Math.abs(sum(s.broadcast.sent) - 3) < 1e-9, 'outflows conserve the verified amount');
+  assert.ok(escrowCore.verifyReport(out.receipt, s.boxPub));
+  assert.equal(out.receipt.settlement, 2.7);
+  assert.equal(out.receipt.refund, 0);
+});
+
+test('P — single-payment with platformFee 0 is a pure refund: whole amount, no fee outflow', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  // refunding the original sender: payoutTo === sender
+  const signed = singlePayment(s, 'ringP', { amount: 0.5, sender: 'caller', payoutTo: 'caller', platformFee: 0 });
+  const out = await s.box.handleReport(signed);
+
+  assert.equal(out.status, 'settled');
+  assert.equal(s.broadcast.sent.length, 1, 'refund only, no fee line');
+  assert.equal(s.broadcast.sent[0].to, 'caller');
+  assert.equal(parseFloat(s.broadcast.sent[0].amount), 0.5);
+});
+
+test('Q — single-payment REDELIVERY is a no-op (no double disburse)', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const signed = singlePayment(s, 'dmQ', { amount: 1, payoutTo: 'completenoober', platformFee: 0.10 });
+  const out1 = await s.box.handleReport(signed);
+  const out2 = await s.box.handleReport(signed);
+  assert.equal(out1.status, 'settled');
+  assert.equal(out2.status, 'duplicate');
+  assert.equal(s.broadcast.sent.length, 2, 'still just the one settlement\'s outflows');
+});
+
+test('R — a FORGED single-payment amount (not on chain) is rejected, nothing disbursed', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const signed = singlePayment(s, 'dmR', { amount: 5, payoutTo: 'completenoober', platformFee: 0.10 });
+  // tamper the claimed amount AFTER the on-chain tx was registered for a different amount —
+  // verifyPayment structurally rejects the mismatch (never mind/never mint).
+  signed.facts.payments[0].amount = 500;
+  const out = await s.box.handleReport(signed);
+  assert.equal(out.status, 'rejected');
+  assert.equal(s.broadcast.sent.length, 0);
+  assert.equal(s.ledger.getPaymentsByRef('dmR').length, 0, 'nothing recorded, ref left open for a corrected re-report');
+});

@@ -128,6 +128,11 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     }
 
     const facts = signed.facts || {};
+
+    // Single-payment settlements (paid DMs/attachments/invites/ring-fee refunds) have no
+    // duration/cap/ring-connect-deposit concept — a distinct, much simpler handler.
+    if (facts.kind === 'single-payment') return handleSinglePayment(signed, ref, facts);
+
     const callFacts = facts.callFacts || {};
     const payments = Array.isArray(facts.payments) ? facts.payments : [];
 
@@ -307,6 +312,103 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     const signedReceipt = boxSkHex ? escrowCore.signReport(receipt, boxSkHex) : receipt;
 
     log('info', `settled ${ref}: payout/refund/fee, status=${overall}`);
+    return { status: overall, ref, receipt: signedReceipt, outflows: split.outflows };
+  }
+
+  /**
+   * Handle a single-payment report (paid DMs/attachments/invites/ring-fee refunds — anything
+   * that isn't a metered call). Verifies the ONE reported on-chain payment itself (never trusts
+   * the node's claimed amount), splits gross → net (to facts.payoutTo) + fee (to config.feeAccount)
+   * via adapter.singlePaymentSplit, and disburses. platformFee 0 in the facts collapses this to a
+   * pure refund. Same idempotency guards as handleReport (tx_id UNIQUE, atomicClose, nonce).
+   */
+  async function handleSinglePayment(signed, ref, facts) {
+    const payments = Array.isArray(facts.payments) ? facts.payments : [];
+    if (payments.length !== 1) return reject(ref, 'single-payment report must carry exactly one payment');
+    const p = payments[0];
+    const currency = p.currency || facts.currency || config.currency;
+
+    // Independently VERIFY the one payment on-chain — abort to 'retry' on a transient error.
+    let v;
+    try {
+      v = await escrowCore.verifyPayment(
+        { txId: p.txId, sender: p.sender, account: config.account, currency,
+          expectedMemo: p.memo, expectedAmount: p.amount },
+        { getTransaction: deps.getTransaction }
+      );
+    } catch (e) {
+      if (isTransient(e)) return { status: 'retry', ref, reason: `verify ${p.txId}: ${e.message}` };
+      return reject(ref, `structural verify failure: ${e.message}`);
+    }
+    const verifySidechain = deps.verifySidechain || escrowCore.verifySidechain;
+    if (!escrowCore.isNativeCurrency(v.currency) && verifySidechain) {
+      try { await verifySidechain(p.txId); }
+      catch (e) {
+        if (isTransient(e)) return { status: 'retry', ref, reason: `sidechain ${p.txId}: ${e.message}` };
+        return reject(ref, `sidechain reject: ${e.message}`);
+      }
+    }
+
+    // ── SYNCHRONOUS commit section (no await): record + single-winner close atomically. ──
+    const pre = ledger.getPaymentsByRef(ref);
+    if (pre.some(r => r.settle_state === 'closed')) {
+      log('info', `ref ${ref} already settled — returning prior receipt`);
+      return { status: 'already_settled', ref, receipt: receiptFromLedger(ref) };
+    }
+    try {
+      ledger.recordPayment({ tx_id: v.txId, ref, sender: v.sender, currency: v.currency, amount: v.paid,
+        memo: p.memo, block_num: v.blockNum });
+    } catch (e) {
+      if (e && e.code !== 'conflict') throw e; // conflict = already recorded — idempotent
+    }
+    const payRows = ledger.getPaymentsByRef(ref);
+    if (payRows.length === 0) {
+      log('warn', `ref ${ref} has no verified payment — nothing to settle`);
+      return { status: 'rejected', ref, reason: 'no_verified_payments' };
+    }
+    if (!ledger.atomicClose(ref)) {
+      log('info', `ref ${ref} lost atomicClose race — already settling/settled`);
+      return { status: 'already_settled', ref, receipt: receiptFromLedger(ref) };
+    }
+    seen.markSeen(signed.nonce);
+    // ── end synchronous commit section ──
+
+    const verifiedAmount = payRows.reduce((s, r) => s + (Number(r.amount) || 0), 0);
+    const now = nowFn();
+    const split = adapter.singlePaymentSplit(verifiedAmount, facts,
+      { ref, feeAccount: config.feeAccount, places: placesFor(currency) });
+
+    let payoutTx = null, overall = 'settled';
+    for (const o of split.outflows) {
+      const { refund_id } = ledger.recordRefund({
+        ref, to_account: o.to_account, amount: o.amount, currency: o.currency, memo: o.memo, reason: o.reason });
+      try {
+        const { txId } = await escrowCore.disburse(
+          { to: o.to_account, amount: o.amount, currency: o.currency, memo: o.memo,
+            fromAccount: config.account, keyEnv: config.keyEnv, places: placesFor(currency) },
+          { client: deps.broadcastClient }
+        );
+        ledger.markRefundSettled(refund_id, 'sent', txId);
+        o.txId = txId; o.status = 'sent';
+        if (o.kind === 'payout') payoutTx = txId;
+      } catch (e) {
+        if (e && e.code === 'no_key') {
+          o.status = 'pending'; if (overall === 'settled') overall = 'pending';
+          log('error', `disburse ${o.kind} → ${o.to_account} has no key: row left pending`);
+        } else {
+          ledger.markRefundSettled(refund_id, 'failed', null);
+          o.status = 'failed'; overall = 'failed';
+          log('error', `disburse ${o.kind} → ${o.to_account} FAILED: ${e.message}`);
+        }
+      }
+    }
+
+    const receipt = escrowCore.buildSettlementReceipt({
+      ref, settlement: split.net, refund: 0, dust: 0,
+      currency, disburseTx: payoutTx, status: overall, createdAt: now });
+    const signedReceipt = boxSkHex ? escrowCore.signReport(receipt, boxSkHex) : receipt;
+
+    log('info', `settled ${ref} (single-payment): net=${split.net} fee=${split.fee} status=${overall}`);
     return { status: overall, ref, receipt: signedReceipt, outflows: split.outflows };
   }
 
