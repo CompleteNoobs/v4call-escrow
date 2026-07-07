@@ -98,6 +98,17 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     return adapter.precision(currency || config.currency);
   }
 
+  // Resolve a payment currency's TRUE on-chain precision before any money math.
+  // Without this the registry default (3dp) silently rounds 8dp-token payouts
+  // (e.g. 0.9225 TEST → 0.923) and would BREAK <3dp-precision tokens outright.
+  // escrowCore.resolvePrecision caches into the registry, so every later sync
+  // placesFor()/roundCoins() in this settlement sees the real value. Fail-safe:
+  // a failed lookup falls back to the default for THIS settlement and retries later.
+  async function resolveCurrencyPrecision(cur) {
+    try { await (deps.resolvePrecision || escrowCore.resolvePrecision)(cur); }
+    catch (e) { log('warn', `precision resolve ${cur}: ${e.message}`); }
+  }
+
   // Map a disburse error to a durable-row disposition. TRANSIENT (network) + no_key
   // are RETRYABLE → leave the row 'pending' (disbursePending re-attempts after an
   // on-chain idempotency probe, so a landed-but-lost-response tx is never double-paid).
@@ -164,6 +175,11 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
 
     const callFacts = facts.callFacts || {};
     const payments = Array.isArray(facts.payments) ? facts.payments : [];
+
+    // Resolve every distinct payment currency's true precision up front (see helper).
+    for (const cur of new Set([facts.currency, ...payments.map(p => p.currency)].filter(Boolean))) {
+      await resolveCurrencyPrecision(cur);
+    }
 
     // 4. Independently VERIFY each escrowed payment on-chain (the verified envelope).
     //    Collect the verified set; abort to 'retry' on a transient error BEFORE any close.
@@ -357,6 +373,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     if (payments.length !== 1) return rejectTerminal(ref, 'single-payment report must carry exactly one payment', facts.currency);
     const p = payments[0];
     const currency = p.currency || facts.currency || config.currency;
+    await resolveCurrencyPrecision(currency);   // true precision before any money math
 
     // Independently VERIFY the one payment on-chain — abort to 'retry' on a transient error.
     let v;
@@ -475,6 +492,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
         // status:'not_found' → confirmed not yet sent → safe to (re)disburse below.
       }
       try {
+        await resolveCurrencyPrecision(r.currency);   // registry is empty after a restart
         const { txId } = await escrowCore.disburse(
           { to: r.to_account, amount: r.amount, currency: r.currency, memo: r.memo,
             fromAccount: config.account, keyEnv: config.keyEnv, places: placesFor(r.currency) },

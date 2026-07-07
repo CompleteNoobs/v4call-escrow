@@ -644,3 +644,38 @@ test('Z — when the LAST pending row of a ref lands, onRefCompleted fires once 
   await box.disbursePending();   // nothing pending → no duplicate completion
   assert.equal(completed.length, 1, 'no re-fire on a later empty run');
 });
+
+test('AA — 8dp token payment: precision resolved BEFORE money math; payout carries 8dp (0.92250000, not 0.923)', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const ref = 'dmAA', txId = 'tx_dmAA', m = memo('text', ref);
+  // The one on-chain payment is an HE custom_json tokens/transfer of 1.025 TOK8.
+  const tok8Tx = { block_num: 100, operations: [
+    ['custom_json', { id: 'ssc-mainnet-hive', required_auths: ['cnoobz'], required_posting_auths: [],
+      json: JSON.stringify({ contractName: 'tokens', contractAction: 'transfer',
+        contractPayload: { symbol: 'TOK8', to: s.config.account, quantity: '1.02500000', memo: m } }) }],
+  ] };
+  const resolved = [];
+  const rawOps = [];   // the shared makeBroadcast only captures native-transfer fields; capture raw ops here
+  const box = s.mkBox({
+    getTransaction: async (id) => id === txId ? tok8Tx : { block_num: null, operations: [] },
+    verifySidechain: async () => ({ confirmed: true }),
+    resolvePrecision: async (cur) => { resolved.push(cur); escrowCore.registerPrecision(cur, 8); },
+    broadcastClient: { broadcast: { sendOperations: async (ops) => { rawOps.push(ops[0]); return { id: 'tok8tx_' + rawOps.length }; } } },
+  });
+
+  const facts = { kind: 'single-payment', currency: 'TOK8', payoutTo: 'guest33', platformFee: 0.10,
+    payments: [{ txId, sender: 'cnoobz', amount: 1.025, memo: m, currency: 'TOK8' }] };
+  const report = escrowCore.buildEventReport({ service: 'v4call', ref, subject: ref, facts,
+    nonce: `${ref}:settle`, createdAt: NOW, reporter: 'tnode' });
+  const out = await box.handleReport(escrowCore.signReport(report, s.nodeSk));
+
+  assert.equal(out.status, 'settled');
+  assert.ok(resolved.includes('TOK8'), 'precision resolver consulted for the payment currency');
+  // 1.025 × 0.9 = 0.9225 — representable ONLY at ≥4dp. The broadcast op's HE quantity
+  // must carry the full 8dp, not the registry-default 3dp rounding (0.923).
+  const payoutOp = rawOps.find(op => op[0] === 'custom_json' && op[1].json.includes('payout'));
+  assert.ok(payoutOp, 'payout broadcast');
+  const qty = JSON.parse(payoutOp[1].json).contractPayload.quantity;
+  assert.equal(qty, '0.92250000', 'payout quantity is 8dp');
+});
