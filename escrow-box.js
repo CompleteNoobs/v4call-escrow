@@ -37,7 +37,13 @@
 // Purposes whose on-chain amount forms the refundable DEPOSIT cap (vs the non-refundable
 // ring → platform and connect → callee buckets). Classification is by the on-chain-verified
 // memo purpose (`namespace:purpose:reservationId`), so it can't be spoofed by the node.
-const DEPOSIT_PURPOSES = new Set(['call', 'deposit', 'topup']);
+// MUST mirror the settle-step bucket rule exactly (step 5: "call/deposit/topup/unknown →
+// refundable cap"): everything that is NOT an explicit ring/connect transfer is deposit.
+// The live client's combined transfer uses purpose `pay` (`v4call:pay:<callId>:<callee>`);
+// classifying with a purpose whitelist here while step 5 used a ring/connect blacklist made
+// every real box-mode call reject with asserted_split_exceeds_deposit (fed testing 2026-07-07).
+const NON_DEPOSIT_PURPOSES = new Set(['ring', 'connect']);
+const isDepositPurpose = (p) => !NON_DEPOSIT_PURPOSES.has(p);
 
 function isTransient(err) {
   // escrow-core.verifyPayment throws CODED errors for every on-chain verdict:
@@ -222,7 +228,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     const assertConnect0 = Math.max(0, Number(callFacts.connectPaid) || 0);
     if (assertRing0 + assertConnect0 > 0) {
       const depositVerified = verified.reduce((s, x) =>
-        s + (DEPOSIT_PURPOSES.has(x.purpose) ? (Number(x.v.paid) || 0) : 0), 0);
+        s + (isDepositPurpose(x.purpose) ? (Number(x.v.paid) || 0) : 0), 0);
       const guardFloor = Math.pow(10, -placesFor((verified[0] && verified[0].v.currency) || config.currency));
       if (assertRing0 + assertConnect0 > depositVerified + guardFloor) {
         return rejectTerminal(ref, 'asserted_split_exceeds_deposit', facts.currency);
@@ -243,7 +249,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
         memo, block_num: v.blockNum };
       // Per-call locked facts (node-asserted; only ever re-split the verified envelope) are
       // persisted on the DEPOSIT rows so a crash-recovering box can settle without the report.
-      if (DEPOSIT_PURPOSES.has(purpose)) {
+      if (isDepositPurpose(purpose)) {
         if (callFacts.ratePerHour  != null) row.rate_per_hour = Number(callFacts.ratePerHour);
         if (callFacts.startTs      != null) row.start_ts      = Number(callFacts.startTs);
         if (callFacts.platformFee  != null) row.platform_fee  = Number(callFacts.platformFee);
@@ -556,4 +562,4 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
   return { handleReport, disbursePending, start, _seen: seen };
 }
 
-module.exports = { createEscrowBox, DEPOSIT_PURPOSES };
+module.exports = { createEscrowBox, isDepositPurpose, NON_DEPOSIT_PURPOSES };

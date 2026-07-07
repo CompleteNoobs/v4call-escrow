@@ -353,6 +353,34 @@ test('L — combined transfer: box re-splits asserted ring/connect, conserves, I
   assert.equal(out.receipt.refund, 1.0);
 });
 
+test('L2 — REGRESSION: the LIVE client memo purpose is `pay` (v4call:pay:<callId>:<callee>) — classifies as deposit-bucket', async () => {
+  // Found in fed testing 2026-07-07: the pre-commit guard classified deposits with a purpose
+  // whitelist (call/deposit/topup) while the settle step used a ring/connect blacklist. The
+  // real client's combined transfer memo is `v4call:pay:...`, so the guard saw ZERO verified
+  // deposit and terminally rejected every real box-mode call with asserted_split_exceeds_deposit.
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const callId = 'cL2';
+  const txId = `tx_${callId}_combined`;
+  const m = `v4call:pay:${callId}:callee`;   // the LIVE memo shape, verbatim
+  s.chain.add(txId, { sender: 'caller', account: s.config.account, amount: 2.06, memo: m });
+  const callFacts = { ratePerHour: 2, platformFee: 0.10, callee: 'callee', startTs: NOW - HALF_HOUR,
+    maxDurationMin: 120, connectPaid: 0.05, ringPaid: 0.01 };
+  const facts = { kind: 'call-end', endReason: 'hangup', endedAt: NOW, durationMs: HALF_HOUR, currency: 'HBD', callFacts,
+    payments: [{ txId, sender: 'caller', purpose: 'pay', amount: 2.00, memo: m, currency: 'HBD' }] };
+  const report = escrowCore.buildEventReport({ service: 'v4call', ref: callId, subject: callId, facts,
+    nonce: `${callId}:settle`, createdAt: NOW, reporter: 'tnode' });
+  const out = await s.box.handleReport(escrowCore.signReport(report, s.nodeSk));
+
+  assert.equal(out.status, 'settled', `purpose 'pay' must settle, not reject (got ${out.reason || out.status})`);
+  // IDENTICAL numbers to test L — 'pay' and 'call' classify the same.
+  const byMemo = Object.fromEntries(s.broadcast.sent.map(x => [x.memo.split(':')[1], x]));
+  assert.equal(parseFloat(byMemo.payout.amount), 0.945);
+  assert.equal(parseFloat(byMemo.refund.amount), 1.0);
+  assert.equal(parseFloat(byMemo.fee.amount), 0.115);
+  assert.ok(Math.abs(sum(s.broadcast.sent) - 2.06) < 1e-9, 'conserves the on-chain-verified envelope');
+});
+
 test('M — a LYING combined re-split (inflated connect, still ≤ deposit) can only RE-SPLIT, never mint', async () => {
   process.env[KEY_ENV] = THROWAWAY_KEY;
   const s = setup();
