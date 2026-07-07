@@ -98,6 +98,18 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     return adapter.precision(currency || config.currency);
   }
 
+  // Map a disburse error to a durable-row disposition. TRANSIENT (network) + no_key
+  // are RETRYABLE → leave the row 'pending' (disbursePending re-attempts after an
+  // on-chain idempotency probe, so a landed-but-lost-response tx is never double-paid).
+  // Only a PERMANENT failure (bad sig / insufficient balance / RC / malformed) is the
+  // terminal 'failed'. Belt-and-braces re-classify raw errors in case a transport
+  // bypassed escrow-core's classifier; unknown shapes fail closed to 'failed'.
+  function dispositionForDisburseError(e) {
+    if (e && (e.code === 'no_key' || e.code === 'transient')) return 'pending';
+    try { if (escrowCore.classifyBroadcastError && escrowCore.classifyBroadcastError(e) === 'transient') return 'pending'; } catch {}
+    return 'failed';
+  }
+
   // Build a settlement-receipt from the durable state of an already-settled ref, so a
   // redelivered report gets the SAME answer without re-disbursing.
   function receiptFromLedger(ref, status) {
@@ -310,14 +322,15 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
         o.txId = txId; o.status = 'sent';
         if (o.kind === 'payout') payoutTx = txId;
       } catch (e) {
-        if (e && e.code === 'no_key') {
-          // leave the refund row 'pending' for manual/again settlement — NEVER double-paid
+        if (dispositionForDisburseError(e) === 'pending') {
+          // retryable (transient network / no key) — leave 'pending'; disbursePending
+          // re-attempts after an idempotency probe. NEVER double-paid.
           o.status = 'pending'; if (overall === 'settled') overall = 'pending';
-          log('error', `disburse ${o.kind} → ${o.to_account} has no key: row left pending`);
+          log('error', `disburse ${o.kind} → ${o.to_account} left PENDING (retryable ${e.code || 'net'}): ${e.message}`);
         } else {
           ledger.markRefundSettled(refund_id, 'failed', null);
           o.status = 'failed'; overall = 'failed';
-          log('error', `disburse ${o.kind} → ${o.to_account} FAILED: ${e.message}`);
+          log('error', `disburse ${o.kind} → ${o.to_account} FAILED (permanent): ${e.message}`);
         }
       }
     }
@@ -409,13 +422,13 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
         o.txId = txId; o.status = 'sent';
         if (o.kind === 'payout') payoutTx = txId;
       } catch (e) {
-        if (e && e.code === 'no_key') {
+        if (dispositionForDisburseError(e) === 'pending') {
           o.status = 'pending'; if (overall === 'settled') overall = 'pending';
-          log('error', `disburse ${o.kind} → ${o.to_account} has no key: row left pending`);
+          log('error', `disburse ${o.kind} → ${o.to_account} left PENDING (retryable ${e.code || 'net'}): ${e.message}`);
         } else {
           ledger.markRefundSettled(refund_id, 'failed', null);
           o.status = 'failed'; overall = 'failed';
-          log('error', `disburse ${o.kind} → ${o.to_account} FAILED: ${e.message}`);
+          log('error', `disburse ${o.kind} → ${o.to_account} FAILED (permanent): ${e.message}`);
         }
       }
     }
@@ -435,7 +448,25 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
   async function disbursePending() {
     const pending = ledger.db.prepare("SELECT * FROM refunds WHERE status = 'pending'").all();
     let done = 0;
+    const probeFn = deps.findOutgoingByMemo || escrowCore.findOutgoingByMemo;
     for (const r of pending) {
+      // IDEMPOTENCY PROBE FIRST: if this exact memo already went out from the escrow
+      // account, a prior attempt DID land (its response was just lost) — mark 'sent',
+      // never re-broadcast. An inconclusive probe (status:'error') means UNKNOWN, so we
+      // skip this row this cycle rather than risk a double-pay. This is what makes the
+      // transient→pending retry safe.
+      if (probeFn) {
+        let probe;
+        try { probe = await probeFn(config.account, r.memo, r.currency); }
+        catch (e) { log('warn', `recovery: ${r.refund_id} probe threw — skip this cycle: ${e.message}`); continue; }
+        if (probe && probe.status === 'found') {
+          ledger.markRefundSettled(r.refund_id, 'sent', probe.txId || null);
+          done++; log('info', `recovery: ${r.refund_id} already on-chain (memo match) — marked sent`);
+          continue;
+        }
+        if (probe && probe.status === 'error') { log('warn', `recovery: ${r.refund_id} probe inconclusive — skip this cycle`); continue; }
+        // status:'not_found' → confirmed not yet sent → safe to (re)disburse below.
+      }
       try {
         const { txId } = await escrowCore.disburse(
           { to: r.to_account, amount: r.amount, currency: r.currency, memo: r.memo,
@@ -445,9 +476,9 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
         ledger.markRefundSettled(r.refund_id, 'sent', txId);
         done++;
       } catch (e) {
-        if (e && e.code === 'no_key') { log('error', `recovery: ${r.refund_id} still no key — left pending`); continue; }
+        if (dispositionForDisburseError(e) === 'pending') { log('error', `recovery: ${r.refund_id} still ${e.code || 'transient'} — left pending`); continue; }
         ledger.markRefundSettled(r.refund_id, 'failed', null);
-        log('error', `recovery: ${r.refund_id} failed: ${e.message}`);
+        log('error', `recovery: ${r.refund_id} failed (permanent): ${e.message}`);
       }
     }
     if (done) log('info', `recovery disbursed ${done} pending refund(s)`);
@@ -463,6 +494,14 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
         if (out.receipt && deps.transport.publish) await deps.transport.publish(out.receipt, { to: signed.pubkey });
       });
       log('info', 'escrow box listening for event-reports');
+    }
+    // Periodic recovery: retry any 'pending' refund (a transient disburse failure) on a
+    // timer so a payout that couldn't broadcast lands as soon as the network recovers —
+    // without waiting for the next report or a restart. Idempotency-probe-guarded above.
+    const retryMs = Number(deps.pendingRetryMs) || 60000;
+    if (retryMs > 0) {
+      const t = setInterval(() => { disbursePending().catch(e => log('error', `periodic disbursePending: ${e.message}`)); }, retryMs);
+      if (t && t.unref) t.unref();
     }
   }
 

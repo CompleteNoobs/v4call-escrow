@@ -550,3 +550,76 @@ test('V — expert-offer settlement: payout→expert (connect+metered), refund�
   assert.ok(Math.abs(total - 3.5) < 1e-9, 'outflows conserve the funded cap');
   assert.ok(escrowCore.verifyReport(out.receipt, s.boxPub));
 });
+
+// ── Disburse resilience: transient failures are retryable (pending), never terminal ──
+// A flaky Hive node (the live 2026-07-06 failure mode) must NOT strand a settlement.
+// The row stays 'pending' and disbursePending retries — guarded by an on-chain memo
+// probe so a landed-but-lost-response tx can never be double-paid.
+
+// A broadcast client that throws a transient error the first N calls, then succeeds.
+function flakyBroadcast(failFirst = 99) {
+  let n = 0; const sent = [];
+  return { sent,
+    get calls() { return n; },
+    client: { broadcast: { sendOperations: async (ops) => {
+      n++;
+      if (n <= failFirst) throw new Error('Invalid response body while trying to fetch https://api.hive.blog/: Premature close');
+      const id = 'flakytx_' + n; sent.push({ memo: ops[0][1].memo, id }); return { id };
+    } } } };
+}
+
+test('W — a TRANSIENT disburse failure leaves the row pending; disbursePending retries and settles', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const flaky = flakyBroadcast(2);   // payout + fee both fail on the first settle pass
+  const probe = async () => ({ status: 'not_found' });   // nothing on chain yet → safe to (re)disburse
+  const box = s.mkBox({ broadcastClient: flaky.client, findOutgoingByMemo: probe });
+
+  const signed = singlePayment(s, 'dmW', { amount: 3, payoutTo: 'completenoober', platformFee: 0.10 });
+  const out = await box.handleReport(signed);
+  assert.equal(out.status, 'pending', 'settlement status is pending, not failed');
+  assert.equal(flaky.sent.length, 0, 'nothing broadcast yet (both attempts threw)');
+  const rows = s.ledger.db.prepare("SELECT status FROM refunds WHERE ref = 'dmW'").all();
+  assert.ok(rows.length >= 1 && rows.every(r => r.status === 'pending'), 'refund rows are pending, not failed');
+
+  // Network recovers → disbursePending re-attempts (probe says not_found → safe) → sent.
+  const done = await box.disbursePending();
+  assert.equal(done, 2, 'payout + fee disbursed on retry');
+  assert.equal(flaky.sent.length, 2);
+  const after = s.ledger.db.prepare("SELECT status FROM refunds WHERE ref = 'dmW'").all();
+  assert.ok(after.every(r => r.status === 'sent'), 'all refund rows now sent');
+});
+
+test('X — disbursePending with an on-chain memo MATCH marks sent WITHOUT re-broadcasting (no double-pay)', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const flaky = flakyBroadcast(99);   // broadcast ALWAYS fails — proves we never call it when the probe finds the tx
+  // Probe reports the exact memo already went out (a prior attempt landed, response lost).
+  const probe = async (acct, memo) => ({ status: 'found', txId: 'onchain_' + memo.split(':')[1] });
+  const box = s.mkBox({ broadcastClient: flaky.client, findOutgoingByMemo: probe });
+
+  const signed = singlePayment(s, 'dmX', { amount: 3, payoutTo: 'completenoober', platformFee: 0.10 });
+  await box.handleReport(signed);                 // both disburses "fail" → pending
+  const done = await box.disbursePending();
+  assert.equal(flaky.calls, 2, 'the initial settle attempted both, then threw');   // only the initial pass tried to broadcast
+  assert.equal(flaky.sent.length, 0, 'never successfully broadcast');
+  assert.equal(done, 2, 'both rows resolved via the on-chain probe');
+  const rows = s.ledger.db.prepare("SELECT status, tx_id FROM refunds WHERE ref = 'dmX'").all();
+  assert.ok(rows.every(r => r.status === 'sent' && /^onchain_/.test(r.tx_id)), 'marked sent with the on-chain txId, no re-broadcast');
+});
+
+test('Y — an INCONCLUSIVE probe (status:error) leaves the row pending (never blind re-broadcast)', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const flaky = flakyBroadcast(99);
+  const probe = async () => ({ status: 'error' });   // on-chain read failed → UNKNOWN
+  const box = s.mkBox({ broadcastClient: flaky.client, findOutgoingByMemo: probe });
+
+  const signed = singlePayment(s, 'dmY', { amount: 3, payoutTo: 'completenoober', platformFee: 0.10 });
+  await box.handleReport(signed);
+  const done = await box.disbursePending();
+  assert.equal(done, 0, 'nothing resolved while the probe is inconclusive');
+  assert.equal(flaky.sent.length, 0, 'never re-broadcast on an unknown on-chain state');
+  const rows = s.ledger.db.prepare("SELECT status FROM refunds WHERE ref = 'dmY'").all();
+  assert.ok(rows.every(r => r.status === 'pending'), 'rows stay pending for a later retry');
+});
