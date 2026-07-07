@@ -623,3 +623,24 @@ test('Y — an INCONCLUSIVE probe (status:error) leaves the row pending (never b
   const rows = s.ledger.db.prepare("SELECT status FROM refunds WHERE ref = 'dmY'").all();
   assert.ok(rows.every(r => r.status === 'pending'), 'rows stay pending for a later retry');
 });
+
+test('Z — when the LAST pending row of a ref lands, onRefCompleted fires once with the final status', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const flaky = flakyBroadcast(2);   // both outflows fail on the settle pass → pending
+  const completed = [];
+  const box = s.mkBox({ broadcastClient: flaky.client,
+    findOutgoingByMemo: async () => ({ status: 'not_found' }),
+    onRefCompleted: async (ref, status) => completed.push({ ref, status }) });
+
+  const signed = singlePayment(s, 'dmZ', { amount: 3, payoutTo: 'completenoober', platformFee: 0.10 });
+  const out = await box.handleReport(signed);
+  assert.equal(out.status, 'pending');
+  assert.equal(completed.length, 0, 'no completion while rows are still pending');
+
+  await box.disbursePending();   // network recovered → both rows land
+  assert.deepEqual(completed, [{ ref: 'dmZ', status: 'settled' }], 'completion fired once, settled');
+
+  await box.disbursePending();   // nothing pending → no duplicate completion
+  assert.equal(completed.length, 1, 'no re-fire on a later empty run');
+});

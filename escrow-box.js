@@ -445,9 +445,15 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
   // Crash-recovery: disburse any refund rows still 'pending' (e.g. a box that died after
   // atomicClose+recordRefund but before disburse, or a no_key that was later provisioned).
   // Mirrors escrow-core/scripts/dry-run-adversarial.js's recover phase. Idempotent.
+  // Retry every 'pending' refund row. Rows that land are marked 'sent'; when the LAST
+  // pending row of a ref completes this run, deps.onRefCompleted(ref, status) fires
+  // (status 'settled' unless any row of the ref ended 'failed') — start() wires that to
+  // publish an UPDATED settlement-receipt so the node can tell users the money moved
+  // (the original receipt said 'pending'; without this follow-up nobody ever learns).
   async function disbursePending() {
     const pending = ledger.db.prepare("SELECT * FROM refunds WHERE status = 'pending'").all();
     let done = 0;
+    const touched = new Set();
     const probeFn = deps.findOutgoingByMemo || escrowCore.findOutgoingByMemo;
     for (const r of pending) {
       // IDEMPOTENCY PROBE FIRST: if this exact memo already went out from the escrow
@@ -461,7 +467,8 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
         catch (e) { log('warn', `recovery: ${r.refund_id} probe threw — skip this cycle: ${e.message}`); continue; }
         if (probe && probe.status === 'found') {
           ledger.markRefundSettled(r.refund_id, 'sent', probe.txId || null);
-          done++; log('info', `recovery: ${r.refund_id} already on-chain (memo match) — marked sent`);
+          done++; touched.add(r.ref);
+          log('info', `recovery: ${r.refund_id} already on-chain (memo match) — marked sent`);
           continue;
         }
         if (probe && probe.status === 'error') { log('warn', `recovery: ${r.refund_id} probe inconclusive — skip this cycle`); continue; }
@@ -474,19 +481,42 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
           { client: deps.broadcastClient }
         );
         ledger.markRefundSettled(r.refund_id, 'sent', txId);
-        done++;
+        done++; touched.add(r.ref);
       } catch (e) {
-        if (dispositionForDisburseError(e) === 'pending') { log('error', `recovery: ${r.refund_id} still ${e.code || 'transient'} — left pending`); continue; }
+        if (dispositionForDisburseError(e) === 'pending') { log('error', `recovery: ${r.refund_id} (${r.reason || 'outflow'} → ${r.to_account}) still retryable: ${e.message}`); continue; }
         ledger.markRefundSettled(r.refund_id, 'failed', null);
+        touched.add(r.ref);
         log('error', `recovery: ${r.refund_id} failed (permanent): ${e.message}`);
       }
     }
     if (done) log('info', `recovery disbursed ${done} pending refund(s)`);
+    // Fire the completion hook for every touched ref that now has NO pending rows left.
+    if (deps.onRefCompleted && touched.size) {
+      const countPending = ledger.db.prepare("SELECT COUNT(*) AS n FROM refunds WHERE ref = ? AND status = 'pending'");
+      const anyFailed    = ledger.db.prepare("SELECT COUNT(*) AS n FROM refunds WHERE ref = ? AND status = 'failed'");
+      for (const ref of touched) {
+        if (countPending.get(ref).n > 0) continue;
+        const status = anyFailed.get(ref).n > 0 ? 'failed' : 'settled';
+        try { await deps.onRefCompleted(ref, status); }
+        catch (e) { log('error', `onRefCompleted ${ref}: ${e.message}`); }
+      }
+    }
     return done;
   }
 
   // Wire the injected transport: every inbound event-report → handleReport → publish the receipt.
   async function start() {
+    // Default completion hook: when a ref's LAST pending row lands via the recovery
+    // retry, publish a REFRESHED signed receipt (status settled/failed, real numbers)
+    // to the expected reporter(s) — the original receipt said 'pending', and without
+    // this follow-up the node/users never learn the money actually moved.
+    if (!deps.onRefCompleted && deps.transport && deps.transport.publish) {
+      deps.onRefCompleted = async (ref, status) => {
+        const receipt = receiptFromLedger(ref, status);
+        for (const pk of expectedReporters) await deps.transport.publish(receipt, { to: pk });
+        log('info', `published COMPLETION receipt for ${ref} (${status})`);
+      };
+    }
     await disbursePending(); // settle anything left mid-flight before taking new work
     if (deps.transport && deps.transport.subscribe) {
       deps.transport.subscribe(async (signed) => {
