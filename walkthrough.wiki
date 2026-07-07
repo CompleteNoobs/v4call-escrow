@@ -237,16 +237,16 @@ tar czf - --exclude=node_modules --exclude=.git --exclude='*.db' --exclude='*.db
 '''Install + prove each, on the box, as the escrow user''' (so <code>node_modules</code> is owned by the service user):
 
 <pre>
-# escrow-core: compiles better-sqlite3, then runs its 72 offline tests
+# escrow-core: compiles better-sqlite3, then runs its 89 offline tests
 su escrow -s /bin/sh -c 'cd /opt/v4call/escrow-core && npm install --no-audit --no-fund'
 su escrow -s /bin/sh -c 'cd /opt/v4call/escrow-core && node --test test/*.test.js' | grep -E '^. (tests|pass|fail) '
 
-# v4call-escrow: pulls escrow-core (file:) + nostr-tools + dhive, then runs its 14 tests
+# v4call-escrow: pulls escrow-core (file:) + nostr-tools + dhive, then runs its 33 tests
 su escrow -s /bin/sh -c 'cd /opt/v4call/v4call-escrow && npm install --no-audit --no-fund'
 su escrow -s /bin/sh -c 'cd /opt/v4call/v4call-escrow && node --test test/*.test.js' | grep -E '^. (tests|pass|fail) '
 </pre>
 
-Expect '''escrow-core 72/72''' and '''v4call-escrow 14/14''', all offline. ''(better-sqlite3 compiles from source on the first install — a minute or two on 1 vCPU; that's expected.)''
+Expect '''escrow-core 89/89''' and '''v4call-escrow 33/33''', all offline. ''(better-sqlite3 compiles from source on the first install — a minute or two on 1 vCPU; that's expected.)''
 
 '''⚠ Node 24 test invocation''' — the repos' <code>npm test</code> script is <code>node --test test/</code> (a bare directory arg). Newer Node (24, what Alpine 3.23 ships) rejects that with <code>Cannot find module '…/test'</code>. Use the explicit glob <code>node --test test/*.test.js</code> as above (or update the package.json <code>test</code> script to the glob).
 
@@ -270,7 +270,8 @@ ESCROW_CURRENCY=HBD
 # place it lives. For a first boot / dry-run you may use a THROWAWAY key (the box only
 # parses it when it disburses), then swap in the real key before live settlement.
 V4CALL_ESCROW_KEY=PUT_THROWAWAY_THEN_REAL_ACTIVE_KEY_HERE
-# Platform-fee recipient (ring fee + the % cut).
+# Platform-fee recipient (the escrow service % cut of the callee gross; the ring
+# fee itself belongs to the callee — ring-fee model, 2026-07-07).
 FEE_ACCOUNT=v4call
 # Durable ledger + the box's own reporting key (auto-created on first boot).
 ESCROW_DB_PATH=/opt/v4call/v4call-escrow/data/v4call-escrow.db
