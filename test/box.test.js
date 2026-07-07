@@ -61,7 +61,7 @@ function makeBroadcast() {
   };
 }
 
-function setup({ now = NOW, reporters } = {}) {
+function setup({ now = NOW, reporters, configExtra } = {}) {
   escrowCore.registerPrecision('HBD', 3);
   const adapter = escrowCore.createV4callAdapter({ account: 'tboxescrow', currency: 'HBD', keyEnv: KEY_ENV });
   const ledger = escrowCore.openLedger(':memory:', { adapterMigrations: adapter.ledgerMigrations() });
@@ -72,7 +72,7 @@ function setup({ now = NOW, reporters } = {}) {
   const chain = makeChain();
   const broadcast = makeBroadcast();
   const config = { account: 'tboxescrow', currency: 'HBD', keyEnv: KEY_ENV, feeAccount: 'tplatform',
-    expectedReporters: reporters || [nodePub], maxDurationMin: 120 };
+    expectedReporters: reporters || [nodePub], maxDurationMin: 120, ...(configExtra || {}) };
   const mkBox = (extra = {}) => createEscrowBox({
     escrowCore, ledger, adapter, config, boxSkHex: boxSk,
     deps: { getTransaction: chain.getTransaction, broadcastClient: broadcast.client, now: () => now, ...extra },
@@ -706,4 +706,88 @@ test('AA — 8dp token payment: precision resolved BEFORE money math; payout car
   assert.ok(payoutOp, 'payout broadcast');
   const qty = JSON.parse(payoutOp[1].json).contractPayload.quantity;
   assert.equal(qty, '0.92250000', 'payout quantity is 8dp');
+});
+
+// ── Step 6 — call attestations (shadow → enforce) ─────────────────────────────
+// Caller/callee co-sign the call facts with their Hive POSTING keys; the box verifies
+// each independently against the (injected) on-chain posting keys. Shadow = verdict on
+// the receipt, settlement unchanged. Enforce = absent/invalid attestations terminally
+// reject PRE-COMMIT (corrected re-report can still settle).
+const dhiveA = require('module').createRequire(require.resolve('escrow-core'))('@hiveio/dhive');
+const attCallerKey = dhiveA.PrivateKey.fromSeed('att-caller');
+const attCalleeKey = dhiveA.PrivateKey.fromSeed('att-callee');
+const ATT_PUBKEYS = { caller: [attCallerKey.createPublic().toString()], callee: [attCalleeKey.createPublic().toString()] };
+const attChain = async (account) => ATT_PUBKEYS[account] || [];
+
+function signAtt(att, key) {
+  const payload = escrowCore.buildCallAttestationPayload(att);
+  return { ...att, sig: key.sign(dhiveA.cryptoUtils.sha256(payload)).toString() };
+}
+function attestedCall(s, callId, { tamper } = {}) {
+  const startTs = NOW - HALF_HOUR;
+  const atts = [
+    signAtt({ callId, role: 'caller', account: 'caller', startTs, endTs: NOW }, attCallerKey),
+    signAtt({ callId, role: 'callee', account: 'callee', startTs, endTs: NOW }, tamper === 'forged-callee' ? attCallerKey : attCalleeKey),
+  ];
+  const payments = [{ txId: `tx_${callId}_c`, sender: 'caller', purpose: 'pay', amount: 2.06, memo: `v4call:pay:${callId}:callee` }];
+  s.chain.add(payments[0].txId, { sender: 'caller', account: s.config.account, amount: 2.06, memo: payments[0].memo });
+  const callFacts = { ratePerHour: 2, platformFee: 0.10, callee: 'callee', startTs, maxDurationMin: 120, connectPaid: 0.05, ringPaid: 0.01 };
+  const facts = { kind: 'call-end', endReason: 'hangup', endedAt: NOW, durationMs: HALF_HOUR, currency: 'HBD', callFacts, payments,
+    attestations: tamper === 'absent' ? undefined : atts };
+  const report = escrowCore.buildEventReport({ service: 'v4call', ref: callId, subject: callId, facts,
+    nonce: `${callId}:settle`, createdAt: NOW, reporter: 'tnode' });
+  return escrowCore.signReport(report, s.nodeSk);
+}
+
+test('S1 — SHADOW: valid co-signed attestations → settled, verdict ok/ok stamped on the receipt', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const box = s.mkBox({ getAccountPostingPubkeys: attChain });
+  const out = await box.handleReport(attestedCall(s, 'cS1'));
+  assert.equal(out.status, 'settled');
+  assert.deepEqual(out.receipt.attestations, { caller: 'ok', callee: 'ok', ok: true });
+  assert.ok(escrowCore.verifyReport(out.receipt, s.boxPub), 'verdict is INSIDE the signed receipt');
+});
+
+test('S2 — SHADOW: forged callee attestation → verdict recorded, SETTLES ANYWAY (shadow never blocks)', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const box = s.mkBox({ getAccountPostingPubkeys: attChain });
+  const out = await box.handleReport(attestedCall(s, 'cS2', { tamper: 'forged-callee' }));
+  assert.equal(out.status, 'settled', 'shadow mode must not change settlement');
+  assert.equal(out.receipt.attestations.caller, 'ok');
+  assert.equal(out.receipt.attestations.callee, 'sig_not_posting_key');
+  assert.equal(out.receipt.attestations.ok, false);
+});
+
+test('S3 — SHADOW: absent attestations → settles, receipt carries NO attestations field (pre-attestation clients unaffected)', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup();
+  const box = s.mkBox({ getAccountPostingPubkeys: async () => { throw new Error('must not be called'); } });
+  const out = await box.handleReport(attestedCall(s, 'cS3', { tamper: 'absent' }));
+  assert.equal(out.status, 'settled');
+  assert.equal(out.receipt.attestations, undefined);
+});
+
+test('S4 — ENFORCE: forged attestation terminally rejects PRE-COMMIT; a corrected re-report settles', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup({ configExtra: { attestationEnforce: true } });
+  const box = s.mkBox({ getAccountPostingPubkeys: attChain });
+  const bad = await box.handleReport(attestedCall(s, 'cS4', { tamper: 'forged-callee' }));
+  assert.equal(bad.status, 'rejected');
+  assert.match(bad.reason, /^attestation_failed/);
+  assert.equal(s.broadcast.sent.length, 0, 'nothing disbursed');
+  assert.equal(s.ledger.getPaymentsByRef('cS4').length, 0, 'pre-commit — ref left open');
+  const good = await box.handleReport(attestedCall(s, 'cS4'));
+  assert.equal(good.status, 'settled', 'corrected re-report settles the same ref');
+  assert.equal(good.receipt.attestations.ok, true);
+});
+
+test('S5 — ENFORCE: absent attestations also reject (fail closed once enforcing)', async () => {
+  process.env[KEY_ENV] = THROWAWAY_KEY;
+  const s = setup({ configExtra: { attestationEnforce: true } });
+  const box = s.mkBox({ getAccountPostingPubkeys: attChain });
+  const out = await box.handleReport(attestedCall(s, 'cS5', { tamper: 'absent' }));
+  assert.equal(out.status, 'rejected');
+  assert.match(out.reason, /caller=absent/);
 });

@@ -235,6 +235,29 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
       }
     }
 
+    // 4c. Step 6 — call attestations (SHADOW MODE). Caller/callee co-signed views of the
+    // call facts ride in facts.attestations; verify each INDEPENDENTLY of the reporting
+    // node (ECDSA-recover → the account's on-chain posting keys — a lying node can't
+    // forge these without the users' keys) and log the verdict. Shadow = verify + log +
+    // stamp the receipt, settle exactly as before. ATTESTATION_ENFORCE=true (the Step-6
+    // promotion flag; config.attestationEnforce) instead TERMINALLY rejects a call-end
+    // whose attestations are absent/invalid — still pre-commit, so a corrected re-report
+    // can settle. Verification is fail-soft: a chain outage yields 'unverifiable', which
+    // shadow logs and enforce treats as not-ok (fail closed).
+    let attVerdict = null;
+    {
+      const attCaller = (verified[0] && verified[0].v.sender) || (facts.payments[0] && facts.payments[0].sender) || null;
+      attVerdict = await escrowCore.verifyCallAttestationSet(
+        facts.attestations,
+        { callId: ref, caller: attCaller, callee: callFacts.callee, durationMs: Number(facts.durationMs) || 0 },
+        { getAccountPostingPubkeys: deps.getAccountPostingPubkeys || escrowCore.getAccountPostingPubkeys }
+      );
+      log('info', `attestation ${config.attestationEnforce ? 'ENFORCE' : 'shadow'} ${ref}: caller=${attVerdict.caller} callee=${attVerdict.callee} (reported ${Math.round((Number(facts.durationMs) || 0) / 1000)}s)`);
+      if (config.attestationEnforce && !attVerdict.ok) {
+        return rejectTerminal(ref, `attestation_failed:caller=${attVerdict.caller},callee=${attVerdict.callee}`, facts.currency);
+      }
+    }
+
     // ── SYNCHRONOUS commit section (no await): record + single-winner close atomically. ──
     // A ref that ALREADY has a closed row is settled — ignore (this also blocks an attacker
     // appending a fresh payment to a settled ref to retrigger settlement).
@@ -361,6 +384,11 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     const receipt = escrowCore.buildSettlementReceipt({
       ref, settlement: settled.settlement, refund: settled.refund, dust: settled.dust,
       currency, disburseTx: payoutTx, status: overall, createdAt: now });
+    // Step-6 shadow verdict rides ON the signed receipt so the node (and its logs/UI)
+    // sees what the box concluded about the co-signed call facts.
+    if (attVerdict && attVerdict.anyPresent) {
+      receipt.attestations = { caller: attVerdict.caller, callee: attVerdict.callee, ok: attVerdict.ok };
+    }
     const signedReceipt = boxSkHex ? escrowCore.signReport(receipt, boxSkHex) : receipt;
 
     log('info', `settled ${ref}: payout/refund/fee, status=${overall}`);

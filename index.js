@@ -51,6 +51,12 @@ async function main() {
   const relays   = (process.env.NOSTR_RELAYS || '').split(',').map(s => s.trim()).filter(Boolean);
   const reporters = (process.env.ESCROW_EXPECTED_REPORTERS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   const maxDurationMin = parseInt(process.env.MAX_CALL_DURATION_MIN || '120', 10);
+  // Step 6 — call attestations. false (DEFAULT) = SHADOW mode: verify caller/callee
+  // co-signatures against on-chain posting keys, log + stamp the receipt, settle as
+  // before. true = ENFORCE: terminally reject call-ends with absent/invalid
+  // attestations. Promotion ladder (handover-decoupling §7): restricted circle +
+  // shadow → expert review → flip enforce → open fed. DO NOT flip without review.
+  const attestationEnforce = /^(1|true|yes)$/i.test((process.env.ATTESTATION_ENFORCE || '').trim());
 
   if (reporters.length === 0) { console.error('[escrow-box] FATAL: ESCROW_EXPECTED_REPORTERS is required (fail-closed: a money box must know which node key(s) it trusts)'); process.exit(1); }
   if (!reporters.every(r => /^[0-9a-f]{64}$/.test(r))) { console.error('[escrow-box] FATAL: ESCROW_EXPECTED_REPORTERS must be 64-hex schnorr pubkeys'); process.exit(1); }
@@ -77,7 +83,7 @@ async function main() {
 
   const box = createEscrowBox({
     escrowCore, ledger, adapter,
-    config: { account, currency, keyEnv, feeAccount, expectedReporters: reporters, maxDurationMin },
+    config: { account, currency, keyEnv, feeAccount, expectedReporters: reporters, maxDurationMin, attestationEnforce },
     boxSkHex,
     deps: { transport },          // getTransaction/broadcastClient default to LIVE chain
     log,
