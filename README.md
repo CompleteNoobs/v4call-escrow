@@ -26,6 +26,23 @@ So a lying report can only **re-split** a call's verified deposit between caller
 the same two durable guards used in-process today: `tx_id UNIQUE` (replay) + single-winner
 `atomicClose` (crash/redelivery/concurrency).
 
+## Disburse resilience (proven live, 2026-07-07)
+
+A payout is never stranded by a flaky network, and never double-paid by a retry:
+
+- A **transient** broadcast failure (or a missing key) leaves the refund row `pending` — only a
+  permanent on-chain rejection (bad sig, insufficient balance, RC) is terminal `failed`.
+- `disbursePending` retries pending rows on a **60s tick**, and **before every retry** runs
+  `findOutgoingByMemo` (on-chain probe): a memo match means a prior attempt landed and its response
+  was lost → mark `sent`, never re-broadcast; an inconclusive probe skips the cycle. Broadcasts go
+  out via escrow-core's `nativeBroadcast` (offline dhive signing + native-fetch JSON-RPC — dhive's
+  bundled node-fetch proved 100% broken on this box).
+- **Terminal receipts**: an authorized-but-structurally-bad report (e.g. payment to an account this
+  box doesn't hold) gets a signed `status:'failed'` receipt so the node stops republishing it.
+  Hard-gate rejections (bad sig / unauthorized reporter) stay silent — no receipt oracle.
+- **Completion receipts**: when a ref's last pending payout finally lands, the box publishes a
+  refreshed signed receipt — the node upgrades its ledger and tells both parties the money moved.
+
 ## Layout
 
 | File | Role |
@@ -39,18 +56,19 @@ the same two durable guards used in-process today: `tx_id UNIQUE` (replay) + sin
 
 ```sh
 npm install            # escrow-core sibling must be cloned next to this repo
-npm test               # 10 passing — settle+conserve, the two hard gates, idempotency
+npm test               # 26 passing — settle+conserve, the two hard gates, idempotency
                        # (in-process + restart), lying-only-resplits, forged-dropped,
-                       # transient→retry, no-key→recover-exactly-once
+                       # transient→pending→retry, probe-guarded no-double-pay,
+                       # terminal failed receipts, completion-fires-once, single-payment
+                       # settlements (paid DMs/invites), no-key→recover-exactly-once
+                       # (Node 24: use  node --test test/*.test.js)
 ```
 
-## Deploy (gated)
+## Deploy
 
-Standing up the real box on its own minimal Alpine host with a real Hive account + the real money
-key, and the **live TEST-token dry-run** before any production node points at it, are **owner-gated**
-— see the deploy runbook (`walkthrough.wiki`, forthcoming) and handover-escrow-core §8.
-**No Claude / no dev tooling on the money box** — operate via logs + `docker exec`.
-
-The node-side flip (node → keyless reporter that publishes `event-report`s and consumes
-`settlement-receipt`s) is the **separate next increment** (handover-escrow-core §6 territory; the
-in-process seam already exists in `v4call-node`).
+Runbook: **`walkthrough.wiki`** — patched/firewalled/key-only-SSH Alpine host, unprivileged user,
+OpenRC service. **Live** at `escrow.v4call.com`, settling real TEST-token sessions for
+`node.v4call.com` (which runs keyless, `ESCROW_MODE=box`). The remaining money gate is the owner
+placing the **real** (non-TEST) escrow account's active key.
+**Never install Claude / dev tooling on the money box** — the box stays minimal code doing one job;
+SSH access for logs/deploys is fine (owner rule, clarified 2026-07-07).

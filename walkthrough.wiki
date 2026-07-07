@@ -371,6 +371,9 @@ The box is '''stood up''' but not yet carrying real money. Before any production
 
 == Common Problems and Fixes ==
 
+=== Every disburse fails with "Invalid response body … Premature close" (payouts stuck pending) ===
+Diagnosed live 2026-07-07 on this exact host class (Alpine + Node 24): '''dhive's bundled network layer (cross-fetch/node-fetch) is broken here''' — dhive Client calls failed 6/6 against every Hive node, while native <code>fetch</code> and core <code>https</code> from the same box were 100% clean. It is NOT the Hive nodes, NOT nftables, NOT your <code>.env</code>. '''Fixed in escrow-core ≥ <code>0d1b127</code>''': <code>disburse</code> now signs offline with dhive and broadcasts via native fetch (<code>nativeBroadcast</code>). If you see this, <code>git pull</code> both repos and restart the service. While any payout sits <code>pending</code>, the box retries it every 60s behind an on-chain memo probe (so a retry can never double-pay) and publishes a completion receipt when it lands — watch the log for <code>recovery disbursed</code>, or inspect the <code>refunds</code> table.
+
 === nftables: "Your kernel lacks nftables support" / "Unable to initialize Netlink socket" ===
 You upgraded the kernel (<code>apk upgrade</code> pulled <code>linux-virt</code>) but haven't rebooted, so the running kernel's modules no longer match what's on disk. '''Reboot''', then start nftables.
 
