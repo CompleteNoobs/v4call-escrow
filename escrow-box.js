@@ -35,7 +35,8 @@
 'use strict';
 
 // Purposes whose on-chain amount forms the refundable DEPOSIT cap (vs the non-refundable
-// ring → platform and connect → callee buckets). Classification is by the on-chain-verified
+// ring/connect buckets, both part of the callee gross — ring-fee model, OWNER 2026-07-07).
+// Classification is by the on-chain-verified
 // memo purpose (`namespace:purpose:reservationId`), so it can't be spoofed by the node.
 // MUST mirror the settle-step bucket rule exactly (step 5: "call/deposit/topup/unknown →
 // refundable cap"): everything that is NOT an explicit ring/connect transfer is deposit.

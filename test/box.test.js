@@ -81,8 +81,9 @@ function setup({ now = NOW, reporters, configExtra } = {}) {
   return { adapter, ledger, nodeSk, nodePub, boxSk, boxPub, chain, broadcast, config, box: mkBox(), mkBox };
 }
 
-// Standard call: ring 0.01 → platform, connect 0.05 → callee, deposit 2.0 (refundable),
-// 2/hr × 30min = 1.0 durationCost → 1.0 refund. fee 10%.
+// Standard call: ring 0.01 + connect 0.05 → callee gross, deposit 2.0 (refundable),
+// 2/hr × 30min = 1.0 durationCost → 1.0 refund. fee 10% of gross (ring included —
+// ring-fee model, OWNER 2026-07-07).
 function standardCall(s, callId, { startTs = NOW - HALF_HOUR, ratePerHour = 2, sk } = {}) {
   const payments = [
     { txId: `tx_${callId}_ring`,    sender: 'caller', purpose: 'ring',    amount: 0.01, memo: memo('ring', callId) },
@@ -109,9 +110,9 @@ test('A — happy path: settles, CONSERVES the envelope, receipt verifies', asyn
   assert.equal(out.status, 'settled');
   assert.equal(s.broadcast.sent.length, 3, 'payout + refund + fee disbursed');
   const byMemo = Object.fromEntries(s.broadcast.sent.map(x => [x.memo.split(':')[1], x]));
-  assert.equal(parseFloat(byMemo.payout.amount), 0.945, 'callee net = (connect+durationCost) − 10%');
+  assert.equal(parseFloat(byMemo.payout.amount), 0.954, 'callee net = (ring+connect+durationCost) − 10%');
   assert.equal(parseFloat(byMemo.refund.amount), 1.0, 'caller refund = deposit − durationCost');
-  assert.equal(parseFloat(byMemo.fee.amount), 0.115, 'platform = ring + 10% of gross');
+  assert.equal(parseFloat(byMemo.fee.amount), 0.106, 'platform = 10% of gross (ring in gross)');
 
   // CONSERVATION: out == ring + connect + deposit (2.06), never more.
   assert.ok(Math.abs(sum(s.broadcast.sent) - 2.06) < 1e-9, 'outflows conserve the verified envelope');
@@ -343,9 +344,9 @@ test('L — combined transfer: box re-splits asserted ring/connect, conserves, I
   assert.equal(s.broadcast.sent.length, 3, 'payout + refund + fee');
   const byMemo = Object.fromEntries(s.broadcast.sent.map(x => [x.memo.split(':')[1], x]));
   // EXACTLY the numbers test A produced from three separate transfers — the re-split is faithful.
-  assert.equal(parseFloat(byMemo.payout.amount), 0.945, 'callee net = (connect+durationCost) − 10%');
+  assert.equal(parseFloat(byMemo.payout.amount), 0.954, 'callee net = (ring+connect+durationCost) − 10%');
   assert.equal(parseFloat(byMemo.refund.amount), 1.0, 'caller refund = deposit − durationCost');
-  assert.equal(parseFloat(byMemo.fee.amount), 0.115, 'platform = ring + 10% of gross (ring carved back from deposit)');
+  assert.equal(parseFloat(byMemo.fee.amount), 0.106, 'platform = 10% of gross (ring carved back from deposit into gross)');
   // CONSERVATION: the box settled the REAL on-chain total (2.06), not the reported cap (2.00).
   assert.ok(Math.abs(sum(s.broadcast.sent) - 2.06) < 1e-9, 'conserves the on-chain-verified envelope');
   assert.ok(escrowCore.verifyReport(out.receipt, s.boxPub), 'receipt verifies under box key');
@@ -375,9 +376,9 @@ test('L2 — REGRESSION: the LIVE client memo purpose is `pay` (v4call:pay:<call
   assert.equal(out.status, 'settled', `purpose 'pay' must settle, not reject (got ${out.reason || out.status})`);
   // IDENTICAL numbers to test L — 'pay' and 'call' classify the same.
   const byMemo = Object.fromEntries(s.broadcast.sent.map(x => [x.memo.split(':')[1], x]));
-  assert.equal(parseFloat(byMemo.payout.amount), 0.945);
+  assert.equal(parseFloat(byMemo.payout.amount), 0.954);
   assert.equal(parseFloat(byMemo.refund.amount), 1.0);
-  assert.equal(parseFloat(byMemo.fee.amount), 0.115);
+  assert.equal(parseFloat(byMemo.fee.amount), 0.106);
   assert.ok(Math.abs(sum(s.broadcast.sent) - 2.06) < 1e-9, 'conserves the on-chain-verified envelope');
 });
 
